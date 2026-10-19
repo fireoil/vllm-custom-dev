@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "my-vllm-plugin"
+version = "0.1.0"
+description = "教程第13章配套：演示 vLLM 三类插件的完整实现"
+requires-python = ">=3.10"
+dependencies = ["vllm"]
+
+# ─────────────────────────────────────────────────────────────
+# 核心：entry-points 注册表。vLLM 通过这 5 个组发现插件
+# （源码: vllm/plugins/__init__.py, vLLM v0.31.0）
+# ─────────────────────────────────────────────────────────────
+[project.entry-points."vllm.general_plugins"]
+# 所有进程都会加载（process0 / engine core / worker），执行返回的函数
+my_banner = "my_vllm_plugin.general:register_banner"
+
+[project.entry-points."vllm.io_processor_plugins"]
+# 仅 API 前端进程(process0)加载；工厂函数返回 IOProcessor 实例
+my_ioproc = "my_vllm_plugin.io_processor:create_io_processor"
+
+[project.entry-points."vllm.endpoint_plugins"]
+# 仅 API 前端进程加载，为 FastAPI app 添加自定义 HTTP 路由。
+# 安全设计：必须显式 export VLLM_PLUGINS=my_healthcheck 才会加载！
+my_healthcheck = "my_vllm_plugin.endpoint:create_endpoint_plugin"
+
+[tool.setuptools.packages.find]
+include = ["my_vllm_plugin*"]
