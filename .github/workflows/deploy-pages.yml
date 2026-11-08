@@ -1,4 +1,5 @@
 name: Deploy Tutorial Pages
+# 触发：网页版目录或本文件变更；亦可在 Actions 页手动触发
 
 on:
   push:
