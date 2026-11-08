@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 14 章 · 硬件与模型适配的代码级细节 ｜ vLLM 定制开发教程</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+  <a class="brand" href="../index.html">
+    <div class="logo">vLLM 定制开发教程</div>
+    <div class="sub">原理 + 实操，知行合一 · v0.31.0</div>
+  </a>
+  <nav>
+    <a href="../index.html"><span class="ch">🏠</span>课程首页</a>
+    <div class="nav-part">第一部分 · 打地基</div>
+    <a href="ch01.html"><span class="ch">01</span>大模型推理基础</a>
+    <a href="ch02.html"><span class="ch">02</span>环境安装与第一次推理</a>
+    <div class="nav-part">第二部分 · 核心原理</div>
+    <a href="ch03.html"><span class="ch">03</span>整体架构鸟瞰</a>
+    <a href="ch04.html"><span class="ch">04</span>PagedAttention 与 KV Cache</a>
+    <a href="ch05.html"><span class="ch">05</span>调度器与连续批处理</a>
+    <a href="ch06.html"><span class="ch">06</span>一次请求的完整旅程</a>
+    <div class="nav-part">第三部分 · 进阶</div>
+    <a href="ch07.html"><span class="ch">07</span>分布式并行 TP/PP/EP</a>
+    <a href="ch08.html"><span class="ch">08</span>高级特性</a>
+    <a href="ch09.html"><span class="ch">09</span>服务化部署与性能调优</a>
+    <div class="nav-part">第四部分 · 定制</div>
+    <a href="ch10.html"><span class="ch">10</span>接入自己的模型</a>
+    <a href="ch11.html"><span class="ch">11</span>DeepSeek/GLM/Qwen 接入</a>
+    <a href="ch12.html"><span class="ch">12</span>异构硬件部署</a>
+    <a href="ch13.html"><span class="ch">13</span>插件机制实现细节</a>
+    <div class="nav-part">第五部分 · 内核级</div>
+    <a href="ch14.html"><span class="ch">14</span>硬件与模型适配细节</a>
+    <a href="ch15.html"><span class="ch">15</span>性能优化与 TileLang</a>
+    <a href="ch16.html"><span class="ch">16</span>TileLang 内核开发指南</a>
+    <div class="nav-part">资料</div>
+    <a href="appendix.html"><span class="ch">附</span>速查表与常见问题</a>
+  </nav>
+</aside>
+  <div class="main">
+    <div class="topbar">
+      <button class="menu-btn">☰</button>
+      <div class="crumb"><b>第 14 章</b> · 硬件与模型适配细节</div>
+      <div class="reading-progress"></div>
+    </div>
+    <article class="content">
+      <header class="chapter-hero">
+        <div class="kicker">CHAPTER 14</div>
+        <h1>硬件与模型适配的代码级细节（深入 Platform 与内核选择链路）</h1>
+        <div class="badges"><span class="badge">🔖 vLLM v0.31.0</span><span class="badge lab">🔬 硬核实验</span></div>
+        <div class="goal">本章目标：从"会用"到"能改"。把第 12 章的平台抽象和第 10/11 章的模型适配拆到方法签名级——所有代码片段都来自 vLLM v0.31.0 真实源码（本章撰写时已逐一核对）。学完你能回答："vLLM 在哪一行决定用哪个内核？我要加一种硬件/换一个内核，代码改在哪？"</div>
+      </header>
+
+      <h2><span class="sec-no">14.1</span><code>Platform</code> 抽象类：硬件要回答的"问卷"</h2>
+      <p>源码：<code>vllm/platforms/interface.py</code>（约 1300 行，<strong>本章建议精读的文件</strong>）。所有平台（内置或插件）都要实现这张"问卷"。按用途分组的关键方法（真实签名摘录）：</p>
+      <div class="code-head"><span>vllm/platforms/interface.py（真实签名摘录）</span></div>
+      <pre><code class="language-python">class Platform:
+    # ── ① 身份识别 ──
+    def is_cuda(self) -&gt; bool ...        # is_rocm/is_tpu/is_xpu/is_cpu/is_zen_cpu
+    def is_cuda_alike(self) -&gt; bool      # CUDA 与 ROCm 通吃的判断(内核兼容时用它)
+    def is_out_of_tree(self) -&gt; bool     # 是否来自硬件插件(第12章昇腾=True)
+    def get_device_capability(self) -&gt; DeviceCapability    # 算力代际(如 (8,9)=Hopper)
+
+    # ── ② 能力声明 ──
+    @property
+    def supported_dtypes(self) -&gt; list[torch.dtype]        # 该芯片支持哪些精度
+    def is_sleep_mode_available(self) -&gt; bool              # 权重休眠(省显存切换)
+    def is_cumem_allocator_available(self) -&gt; bool         # CUDA 内存池特性
+
+    # ── ③ 内核与编译 ──
+    @classmethod
+    def get_attn_backend_cls(cls, selected_backend, head_size, dtype, ...) -&gt; str
+        # ★★ 决定注意力内核的一句话! 返回类名字符串, 如
+        #    "vllm.v1.attention.backends.flash_attn.FlashAttentionBackend"
+    @classmethod
+    def get_supported_vit_attn_backends(cls) -&gt; list[...]   # 视觉塔的内核候选
+    @classmethod
+    def import_kernels(cls) -&gt; None                         # 按需导入内核包
+    @classmethod
+    def register_triton_kernel_overrides(cls) -&gt; None       # 注册 triton 覆盖
+    @classmethod
+    def get_compile_backend(cls) -&gt; str                     # torch.compile 后端
+    @classmethod
+    def import_ir_kernels(cls) -&gt; None                      # IR 层内核(见14.4)
+
+    # ── ④ 设备拓扑 ──
+    @classmethod
+    def device_id_to_physical_device_id(cls, device_id)     # 逻辑卡号→物理卡号
+    @classmethod
+    def logical_device_id_to_visible_device_id(cls, ...)    # CUDA_VISIBLE_DEVICES 体系
+</code></pre>
+      <p><strong>读法</strong>：这张问卷的每一题，都是引擎某处 <code>current_platform.xxx()</code> 的调用点。例如调度/采样代码判断精度能力时问 <code>supported_dtypes</code>；ModelRunner 建注意力层时问 <code>get_attn_backend_cls</code>；多卡初始化时问 device_id 三件套。</p>
+
+      <h2><span class="sec-no">14.2</span>一次"内核选择"的完整代码链路</h2>
+      <p>以"Qwen3-0.6B 在 RTX 4060 上为什么用 FlashAttention 后端"为例，追踪代码：</p>
+      <div class="code-head"><span>内核选择链路（示意）</span></div>
+      <pre><code>ModelRunner 构建注意力层
+   │  调用 current_platform.get_attn_backend_cls(...)
+   ▼
+vllm/platforms/cuda.py → 先看用户显式指定的 --attention-backend / env
+   │  没指定 → 按 DeviceCapability + 库可用性(flash_attn/flashinfer/triton)仲裁
+   ▼
+返回 "vllm.v1.attention.backends.flash_attn.FlashAttentionBackend"
+   │  (字符串→import→实例化, 每层 Attention 模块持有该 backend)
+   ▼
+前向时: FlashAttentionMetadata.build(...) 把调度器给的 block_table(第04章)
+        翻译成内核参数 → 调 paged FlashAttention CUDA/Triton 内核
+</code></pre>
+      <div class="viz" data-viz="arch-diagram">
+        <div class="viz-head"><span class="dot"></span><span class="title">Platform 问卷与内核选择链路</span><span class="desc">点击组件，看它在这条适配链路里的职责（对应 14.1 / 14.2）</span></div>
+        <div class="viz-body"></div>
+        <script type="application/json" class="viz-cfg">{
+  "layers": [
+    {"name": "模型层 · ModelRunner / Attention", "color": "#4f9cf9", "items": [
+      {"name": "统一 Attention 层", "desc": "模型只要用 vLLM 统一 Attention 层，就自动获得当前平台的 backend——14.4 中「免费午餐」的关键"},
+      {"name": "ModelRunner 构建注意力层", "desc": "调用 current_platform.get_attn_backend_cls(...) 向平台发问卷"},
+      {"name": "FlashAttentionMetadata.build(...)", "desc": "前向时把调度器给的 block_table（第 04 章）翻译成内核参数"}
+    ]},
+    {"name": "Platform 问卷层 · platforms/interface.py", "color": "#22c55e", "items": [
+      {"name": "身份识别 is_cuda / is_cuda_alike", "desc": "判断平台归属；is_cuda_alike 是 CUDA 与 ROCm 通吃的判断（内核兼容时用它），硬件插件 is_out_of_tree=True"},
+      {"name": "能力声明 supported_dtypes", "desc": "该芯片支持哪些精度——调度/采样代码判断精度能力时的调用点"},
+      {"name": "get_device_capability", "desc": "算力代际（如 (8,9)=Hopper），是内核仲裁的依据"},
+      {"name": "get_attn_backend_cls ★★", "desc": "决定注意力内核的一句话！返回类名字符串"}
+    ]},
+    {"name": "平台实现层 · backend dispatch", "color": "#f59e0b", "items": [
+      {"name": "cuda.py 仲裁", "desc": "先看用户显式指定的 --attention-backend / env；没指定则按 DeviceCapability + 库可用性（flash_attn/flashinfer/triton）仲裁"},
+      {"name": "rocm.py 同名方法", "desc": "返回 AITER/Triton 系内核——引擎其余代码一行不改"},
+      {"name": "昇腾硬件插件", "desc": "返回自研内核，同样只换这一层"}
+    ]},
+    {"name": "内核实现层 · kernel", "color": "#a78bfa", "items": [
+      {"name": "FlashAttentionBackend", "desc": "字符串→import→实例化，每层 Attention 模块持有该 backend"},
+      {"name": "paged FlashAttention CUDA/Triton 内核", "desc": "链路终点：启动日志 Using ... FlashAttentionBackend 就是这条链路的输出"}
+    ]}
+  ]
+}</script>
+      </div>
+      <p><strong>换平台时的分叉点</strong>：<code>rocm.py</code> 的同名方法会返回 AITER/Triton 系内核；昇腾插件返回自研内核——<strong>引擎其余代码一行不改</strong>，这就是第 12 章"三个绑定部位"中注意力内核的实际实现机制。</p>
+      <blockquote><p>🔍 <strong>动手验证链路</strong>（无需改代码）：<br>
+<code>python3 -c "from vllm.platforms import current_platform as p; print(p.get_attn_backend_cls(...))"</code><br>
+或启动时看日志行 <code>Using ... FlashAttentionBackend</code>——它就是这条链路的终点输出。</p></blockquote>
+
+      <h2><span class="sec-no">14.3</span>跨平台条件导入：vLLM 的教科书模式</h2>
+      <p>硬件插件代码最常见的坑：<code>import tilelang</code>/<code>import aiter</code> 这类<strong>硬件专属库在错误的平台上 import 直接崩</strong>。vLLM 的标准解法（真实源码摘自 <code>vllm/tilelang_utils/__init__.py</code>）：</p>
+      <div class="code-head"><span>vllm/tilelang_utils/__init__.py</span></div>
+      <pre><code class="language-python">from vllm.platforms import current_platform
+from vllm.utils.import_utils import has_tilelang
+
+if TYPE_CHECKING or current_platform.is_cuda():        # ① 只有 CUDA 平台才立即导入
+    if not has_tilelang():
+        raise ImportError("tilelang is required ... `pip install tilelang`")
+    import tilelang
+    import tilelang.language as T
+else:
+    tilelang = None                                    # ② 其他平台: 置 None 占位
+    T = None
+
+def _ensure_tilelang_imported() -&gt; None:              # ③ ROCm 等平台延迟到"首次调用"
+    global T, tilelang
+    if tilelang is not None:
+        return
+    import tilelang as tilelang_module
+    import tilelang.language as tilelang_language
+    tilelang, T = tilelang_module, tilelang_language   # ④ 绑回模块全局
+</code></pre>
+      <p>四条军规（写硬件相关代码时背下来）：</p>
+      <ol>
+        <li><strong>模块级 import 必须带平台门卫</strong>（<code>TYPE_CHECKING or current_platform.is_cuda()</code>——TYPE_CHECKING 保证类型检查器不报错）；</li>
+        <li><strong>不能立即导入的平台置 None</strong>，并用 <code>_ensure_xxx_imported()</code> 提供延迟绑定；</li>
+        <li><strong>缺库要给安装指引</strong>（raise 里带 pip 命令）；</li>
+        <li><strong>所有内核入口先 ensure 再用</strong>。</li>
+      </ol>
+      <blockquote><p>顺带一提：仓库里的测试 <code>tests/kernels/scripts/check_no_tilelang_hijack.py</code> 守护的是另一件事——TileLang 导入时会修改一些全局环境（"hijack"），vLLM 用 CI 测试确保 import 时机受控。<strong>集成第三方 DSL 库时，警惕它的 import 副作用</strong>，这是本节更深一层的工程教训。</p></blockquote>
+
+      <h2><span class="sec-no">14.4</span>模型适配的代码级 Checklist（从 config 到 kernel）</h2>
+      <p>把第 10/11 章的"四步法"落到文件级操作表。假设新增架构 <code>MyModelForCausalLM</code>：</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>#</th><th>改哪里</th><th>具体内容</th><th>参考文件</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td>模型实现</td><td>类 + <code>forward()</code> + <code>load_weights()</code>（权重名映射!）</td><td>抄 <code>models/qwen2.py</code></td></tr>
+          <tr><td>2</td><td>注册表</td><td><code>_MODELS["MyModelForCausalLM"] = ("my_model", "MyModel")</code></td><td><code>models/registry.py</code></td></tr>
+          <tr><td>3</td><td>任务声明</td><td>generate/pool 支持声明</td><td><code>vllm/tasks.py</code></td></tr>
+          <tr><td>4</td><td>注意力</td><td>用统一 <code>Attention</code> 层 → 自动获得当前平台的 backend</td><td><code>layers/attention</code></td></tr>
+          <tr><td>5</td><td>特殊内核</td><td>新算子进 <code>model_executor/kernels/</code>（见第 15 章 TileLang）</td><td><code>kernels/mhc/</code> 范例</td></tr>
+          <tr><td>6</td><td>量化</td><td>config <code>quantization_config</code> → 对应 quant 方案自动挂钩</td><td><code>layers/quantization/</code></td></tr>
+          <tr><td>7</td><td>测试</td><td>生成/一致性测试</td><td><code>tests/models/</code></td></tr>
+        </tbody>
+      </table></div>
+      <p>其中 #4 是"免费午餐"的关键：<strong>只要模型用的是 vLLM 统一 <code>Attention</code> 层</strong>，block_table 传递、backend 选择、TP 切分全部自动成立——这就是第 11 章"三家模型 90% 同构"能成立的技术根基。</p>
+
+      <h2><span class="sec-no">14.5</span>优化定位方法论：先量化，再动手</h2>
+      <p>写优化代码前，必须先回答"慢在哪"。vLLM 生态的定位工具链（由浅入深）：</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>层级</th><th>工具</th><th>看什么</th></tr></thead>
+        <tbody>
+          <tr><td>服务级</td><td><code>/metrics</code> + <code>vllm bench serve</code>（第 09 章）</td><td>TTFT/TPOT/吞吐, 定位阶段</td></tr>
+          <tr><td>进程级</td><td><code>VLLM_LOGGING_LEVEL=DEBUG</code>、<code>torch.profiler</code>（vLLM 内置 profiler 开关）</td><td>每个算子的 CPU/GPU 时间</td></tr>
+          <tr><td>kernel 级</td><td><code>nsys profile</code> / <code>ncu</code>（Nsight Compute）</td><td>kernel 耗时榜、带宽/算力利用率、占用率</td></tr>
+          <tr><td>静态</td><td><code>torch.cuda.memory_summary()</code></td><td>显存碎片/峰值</td></tr>
+        </tbody>
+      </table></div>
+      <p><strong>判定优化的两条铁律</strong>：</p>
+      <ol>
+        <li><strong>先分类</strong>：kernel 慢是因为算力满（compute-bound）还是带宽满（memory-bound）？——<code>ncu</code> 的 SOL（Speed Of Light）表直接给答案。RMSNorm 类=带宽型（去拼合并访存/向量化），GEMM 类=算力型（去拼 tile/pipeline/TensorCore）；</li>
+        <li><strong>对比基准必须同精度同条件</strong>：fp16 vs fp32 的"提速"多半是精度作弊。</li>
+      </ol>
+
+      <h2><span class="sec-no">14.6</span>动手实验</h2>
+      <p>✅ <strong>实验 14-1（必做）</strong>：平台问卷自省。打印 <code>current_platform</code> 的 ①③ 组方法返回值，画出你自己机器的"能力卡片"。</p>
+      <p>✅ <strong>实验 14-2（必做）</strong>：内核链路追踪。带 <code>VLLM_LOGGING_LEVEL=DEBUG</code> 启动服务，在日志中按 14.2 的链路找出：backend 类名 → 参数来源 → 最终内核名，写三行笔记。</p>
+      <p>🔬 <strong>实验 14-3（硬核）</strong>：读 <code>platforms/interface.py</code> 的 <code>get_attn_backend_cls</code> docstring 与 <code>cuda.py</code> 实现，用一段话写清"用户指定、代际仲裁、库可用性"三者的优先级顺序。</p>
+      <p>🔬 <strong>实验 14-4（选做）</strong>：模仿 14.3 的四条军规，把你 lab 里任何脚本的 <code>import torch</code> 改造成"平台门卫 + 延迟导入"模式（为第 15 章写 vLLM 内核做铺垫）。</p>
+
+      <nav class="pager">
+        <a href="ch13.html"><div class="dir">← 上一章</div><div class="title">第 13 章 · vLLM 插件机制实现细节</div></a>
+        <a class="next" href="ch15.html"><div class="dir">下一章 →</div><div class="title">第 15 章 · 性能优化方法论与 TileLang 算子实战</div></a>
+      </nav>
+      <footer>vLLM 定制开发教程 · 可视化网页版 ｜ <a href="../index.html">返回目录</a></footer>
+    </article>
+  </div>
+</div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/visuals.js"></script>
+<script src="../assets/js/mathjax-tex-svg.js"></script>
+</body>
+</html>

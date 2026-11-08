@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 01 章 · 大模型推理基础：一次推理到底发生了什么 ｜ vLLM 定制开发教程</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+  <a class="brand" href="../index.html">
+    <div class="logo">vLLM 定制开发教程</div>
+    <div class="sub">原理 + 实操，知行合一 · v0.31.0</div>
+  </a>
+  <nav>
+    <a href="../index.html"><span class="ch">🏠</span>课程首页</a>
+    <div class="nav-part">第一部分 · 打地基</div>
+    <a href="ch01.html"><span class="ch">01</span>大模型推理基础</a>
+    <a href="ch02.html"><span class="ch">02</span>环境安装与第一次推理</a>
+    <div class="nav-part">第二部分 · 核心原理</div>
+    <a href="ch03.html"><span class="ch">03</span>整体架构鸟瞰</a>
+    <a href="ch04.html"><span class="ch">04</span>PagedAttention 与 KV Cache</a>
+    <a href="ch05.html"><span class="ch">05</span>调度器与连续批处理</a>
+    <a href="ch06.html"><span class="ch">06</span>一次请求的完整旅程</a>
+    <div class="nav-part">第三部分 · 进阶</div>
+    <a href="ch07.html"><span class="ch">07</span>分布式并行 TP/PP/EP</a>
+    <a href="ch08.html"><span class="ch">08</span>高级特性</a>
+    <a href="ch09.html"><span class="ch">09</span>服务化部署与性能调优</a>
+    <div class="nav-part">第四部分 · 定制</div>
+    <a href="ch10.html"><span class="ch">10</span>接入自己的模型</a>
+    <a href="ch11.html"><span class="ch">11</span>DeepSeek/GLM/Qwen 接入</a>
+    <a href="ch12.html"><span class="ch">12</span>异构硬件部署</a>
+    <a href="ch13.html"><span class="ch">13</span>插件机制实现细节</a>
+    <div class="nav-part">第五部分 · 内核级</div>
+    <a href="ch14.html"><span class="ch">14</span>硬件与模型适配细节</a>
+    <a href="ch15.html"><span class="ch">15</span>性能优化与 TileLang</a>
+    <a href="ch16.html"><span class="ch">16</span>TileLang 内核开发指南</a>
+    <div class="nav-part">资料</div>
+    <a href="appendix.html"><span class="ch">附</span>速查表与常见问题</a>
+  </nav>
+</aside>
+  <div class="main">
+    <div class="topbar">
+      <button class="menu-btn">☰</button>
+      <div class="crumb"><b>第 01 章</b> · 大模型推理基础</div>
+      <div class="reading-progress"></div>
+    </div>
+    <article class="content">
+      <header class="chapter-hero">
+        <div class="kicker">CHAPTER 01</div>
+        <h1>大模型推理基础：一次推理到底发生了什么</h1>
+        <div class="badges"><span class="badge">🔖 vLLM v0.31.0</span></div>
+        <div class="goal">本章目标：不写一行 vLLM 代码，先搞懂三件事 —— <strong>① 大模型是怎么"一个字一个字"往外蹦的；② 显存都被谁吃掉了；③ 为什么需要 vLLM。</strong>这三件事是后面所有章节的地基，务必完全弄懂再往下走。</div>
+      </header>
+
+      <h2><span class="sec-no">1.1</span>大模型生成文字的真相：自回归循环</h2>
+      <p>你平时用 ChatGPT，看到的是"一段一段回答"。但在 GPU 眼里，模型是这样工作的：</p>
+      <div class="code-head"><span>示意 · 自回归生成过程</span></div>
+      <pre><code class="language-text">输入: "天空为什么是"
+第1步: 模型吃进整个输入 → 吐出 1 个词 "蓝"
+第2步: 模型吃进 "天空为什么是蓝" → 吐出 1 个词 "色"
+第3步: 模型吃进 "天空为什么是蓝色" → 吐出 "，"
+...
+直到吐出结束符 &lt;eos&gt; 或达到最大长度</code></pre>
+      <p><strong>关键认知：生成 N 个词 = 模型前向计算 N 次，每次只新产出 1 个 token。</strong><br>
+      这就是所谓的<strong>自回归（autoregressive）</strong>。</p>
+      <div class="callout tip">术语：token（词元）≈ 词的一部分。中文里大约 1 个汉字 ≈ 1~2 个 token，英文里约 0.75 个单词 = 1 个 token。模型所有操作的对象都是 token，不是"字"。</div>
+      <h3>两个阶段：Prefill 与 Decode</h3>
+      <div class="table-wrap">
+      <table>
+        <thead><tr><th>阶段</th><th>做什么</th><th>计算特点</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Prefill（预填充）</strong></td><td>处理整段输入 prompt，一次算完所有输入 token</td><td><strong>计算密集型</strong>（大量并行矩阵乘法），GPU 像赛车</td></tr>
+          <tr><td><strong>Decode（解码）</strong></td><td>每步只算 1 个新 token</td><td><strong>访存密集型</strong>（要反复搬运整个模型的权重），GPU 像被限速</td></tr>
+        </tbody>
+      </table>
+      </div>
+      <p>为什么 decode 慢？因为每生成 1 个 token，都要把<strong>几十亿参数全部从显存搬一遍到计算单元</strong>，而计算量只有一点点 —— 显存带宽成了瓶颈。这是后面理解"批量处理能摊薄成本"的伏笔：<strong>一个 batch 里 100 个请求一起 decode，权重只搬一次，每个请求分摊的搬运成本降为 1/100。</strong></p>
+
+      <h2><span class="sec-no">1.2</span>KV Cache：空间换时间的必然选择</h2>
+      <h3>没有 KV Cache 会怎样？</h3>
+      <p>Transformer 的注意力机制需要"拿当前 token 与<strong>所有历史 token</strong> 做运算"。如果每生成一个新 token 都重算全部历史 token 的中间结果，生成 1000 token 的回复，计算量会随长度平方爆炸 —— 完全不可行。</p>
+      <h3>KV Cache 的思路</h3>
+      <p>模型在处理历史 token 时，把每个 token 在<strong>每一层</strong>产生的两个中间向量—— K（Key）和 V（Value）—— 缓存起来，后续步骤直接查表复用：</p>
+      <div class="code-head"><span>示意 · KV Cache 更新步骤</span></div>
+      <pre><code class="language-text">生成第 t 个 token 时:
+  1. 只计算第 t 个 token 的 Q/K/V（新算的只有这一个）
+  2. K_t、V_t 追加进缓存
+  3. 用 Q_t 与缓存里的 [K_1..K_t]、[V_1..V_t] 做注意力</code></pre>
+      <p>代价是：<strong>这些缓存必须一直躺在显存里，直到这个请求结束</strong>。</p>
+      <h3>算一算：KV Cache 到底多大？</h3>
+      <p>公式（每个 token 的 KV 大小）：</p>
+      <p>$$
+      S_{kv} = \underbrace{2}_{K,V} \times L \times H_{kv} \times d_{head} \times \text{每元素字节数}
+      $$</p>
+      <p>其中 $L$ 为层数，$H_{kv}$ 为 KV 头数，$d_{head}$ 为每头维度。</p>
+      <p>以 <strong>Qwen2.5-7B</strong>（FP16）为例：28 层、GQA 4 个 KV 头、每头 128 维、2 字节：</p>
+      <p>$$ 2 \times 28 \times 4 \times 128 \times 2 = 57{,}344 \text{ 字节} \approx 56 \text{ KB/token} $$</p>
+      <p><strong>结论一览（FP16）：</strong></p>
+      <div class="table-wrap">
+      <table>
+        <thead><tr><th>模型</th><th>每 token KV</th><th>生成 1000 token</th><th>4096 token 上下文</th></tr></thead>
+        <tbody>
+          <tr><td>Qwen2.5-0.5B</td><td>≈ 12 KB</td><td>12 MB</td><td>49 MB</td></tr>
+          <tr><td>Qwen2.5-7B</td><td>≈ 56 KB</td><td>56 MB</td><td>224 MB</td></tr>
+          <tr><td>Llama-3-70B</td><td>≈ 320 KB</td><td>320 MB</td><td>1.3 GB</td></tr>
+        </tbody>
+      </table>
+      </div>
+      <p><strong>动手验证</strong>：不用背，用这个一行脚本（把参数换成你的模型）：</p>
+      <div class="code-head"><span>kv_size.py</span></div>
+      <pre><code class="language-python"># kv_size.py —— 换任何模型，算出它的 KV Cache 开销
+n_layers, n_kv_heads, head_dim, bytes_per = 28, 4, 128, 2   # Qwen2.5-7B fp16
+kv_per_token = 2 * n_layers * n_kv_heads * head_dim * bytes_per
+print(f"{kv_per_token/1024:.1f} KB/token, 4096 token 占 {kv_per_token*4096/1e9:.2f} GB")</code></pre>
+      <p>看到 7B 模型一个 4096 长度的请求就要吃掉 224 MB 显存，你就能理解：</p>
+      <blockquote>
+        <p><strong>一个 80GB 显存的 A100，权重只占 140GB(FP16 70B)~ 的一半，剩下的显存全部是给 KV Cache 的"座位"。</strong></p>
+        <p><strong>vLLM 的核心使命：让这些座位利用率做到最高。</strong></p>
+      </blockquote>
+      <div class="viz" data-viz="kv-calc">
+        <div class="viz-head"><span class="dot"></span><span class="title">KV Cache 大小计算器</span><span class="desc">拖动滑块，直观感受任意模型的 KV 显存开销（对应 1.2 节公式）</span></div>
+        <div class="viz-body"></div>
+      </div>
+
+      <h2><span class="sec-no">1.3</span>vLLM 出现之前：三种"坐法"都在浪费座位</h2>
+      <p>假设显存里有 40GB 专门留给 KV Cache。传统推理引擎（比如 HuggingFace Transformers 原生 <code>generate</code>）怎么安排这些空间？</p>
+      <h3>方式一：按最大长度预留（Reservation 浪费）</h3>
+      <div class="code-head"><span>示意 · 预留浪费</span></div>
+      <pre><code class="language-text">请求来了 → 按 max_len=4096 给它预留 224MB → 实际它只生成了 50 个 token
+结果: 97% 的预留空间白白锁死，别的请求用不了</code></pre>
+      <h3>方式二：连续大块分配（碎片浪费）</h3>
+      <p>每个请求的 KV 必须放在<strong>一整块连续显存</strong>里：</p>
+      <div class="code-head"><span>示意 · 外部碎片</span></div>
+      <pre><code class="language-text">显存: [请求A: 300MB][请求B: 500MB][请求A结束后空出300MB][请求C: 需要400MB ❌放不下!]
+       ↑ 300MB 空闲碎片明明够 400MB 用的一部分，但"必须连续"导致谁都用不了</code></pre>
+      <h3>方式三：静态批处理（时间浪费）</h3>
+      <p>凑一批请求（比如 8 个）→ 一起跑 → <strong>最慢的那个</strong>结束才放下一批：</p>
+      <div class="code-head"><span>示意 · 静态批处理空转</span></div>
+      <pre><code class="language-text">第1批: [R1 ✓完成(3步)] [R2 ...还在跑(第25步)] [R3 ✓完成(4步)] ... R2 跑完才进下一批
+       ↑ 7 个座位空转了 20+ 步，GPU 在干瞪眼</code></pre>
+      <p><strong>这三种浪费同时存在，GPU 的真实利用率往往不到 40%。</strong></p>
+      <div class="viz" data-viz="waste-compare">
+        <div class="viz-head"><span class="dot"></span><span class="title">三种浪费 vs 分页</span><span class="desc">传统引擎的"座位浪费率"直观对比（对应 1.3 节）</span></div>
+        <script type="application/json" class="viz-cfg">{"modes":[{"name":"方式一 · 按最大长度预留","desc":"请求只要 50 token，却按 max_len=4096 锁死一整条（Reservation 浪费）","waste":92},{"name":"方式二 · 连续大块分配","desc":"300MB 碎片明明空闲，400MB 的请求却放不进——必须连续（碎片浪费）","waste":60},{"name":"方式三 · 静态批处理","desc":"R1/R3 早已完成，GPU 空转 20+ 步等最慢的 R2（时间浪费）","waste":45},{"name":"vLLM · 分页 + 按需分配","desc":"用多少分多少，完成即让位 → 座位利用率拉满","waste":8,"good":true}]}</script>
+        <div class="viz-body"></div>
+      </div>
+
+      <h2><span class="sec-no">1.4</span>vLLM 的答案</h2>
+      <p>vLLM（UC Berkeley 团队，2023 年论文《Efficient Memory Management for LLM Serving with PagedAttention》）借鉴<strong>操作系统虚拟内存和分页</strong>的思想，逐个击破：</p>
+      <div class="table-wrap">
+      <table>
+        <thead><tr><th>传统浪费</th><th>vLLM 方案</th><th>类比操作系统</th><th>详见</th></tr></thead>
+        <tbody>
+          <tr><td>按最大长度预留</td><td>KV 按需分配小块（block），用多少分多少</td><td>虚拟内存分页</td><td>第04章</td></tr>
+          <tr><td>连续分配碎片</td><td>每块 16 token，逻辑连续物理散落，免碎片</td><td>页表</td><td>第04章</td></tr>
+          <tr><td>空间不能共享</td><td>相同前缀的请求共享 KV 块</td><td>共享内存页 + 引用计数</td><td>第04章</td></tr>
+          <tr><td>静态批处理空转</td><td>每步（token 级）动态进出，即完成即让位</td><td>CPU 时间片调度</td><td>第05章</td></tr>
+        </tbody>
+      </table>
+      </div>
+      <p>实测效果（官方论文，7B~13B 模型）：<strong>吞吐量比当时主流方案提升 2~4 倍</strong>，长请求、大并发下优势更大。</p>
+      <h3>vLLM 的现状（截至本教程撰写）</h3>
+      <ul>
+        <li>2026 年 10 月最新版 <strong>v0.31.0</strong>，V1 架构已完全成熟</li>
+        <li>已成为业界事实标准：各大云厂商的模型服务、推理平台底层大多是 vLLM</li>
+        <li>支持几乎所有主流开源模型 + 各种量化方案 + 多卡/多机</li>
+      </ul>
+      <div class="viz" data-viz="bar-compare">
+        <div class="viz-head"><span class="dot"></span><span class="title">吞吐量对比</span><span class="desc">vLLM 相对 HuggingFace 原生 generate 的吞吐提升（对应 1.4 节）</span></div>
+        <script type="application/json" class="viz-cfg">{"unit":"x","note":"论文实测：7B~13B 模型高并发下吞吐提升 2~4 倍（示意值，随负载变化）","items":[{"label":"HuggingFace 原生 generate","value":1,"color":"#f59e0b"},{"label":"vLLM（PagedAttention）","value":2.2,"color":"#4f9cf9"},{"label":"vLLM（大并发+连续批处理）","value":3.8,"color":"#22c55e"}]}</script>
+        <div class="viz-body"></div>
+      </div>
+
+      <h2><span class="sec-no">1.5</span>本章小结（自测）</h2>
+      <details class="quiz">
+        <summary>📋 本章自测</summary>
+        <div class="quiz-body">
+          <p>不看原文，回答这五个问题：</p>
+          <ol>
+            <li>为什么说 decode 阶段是"访存密集型"？这导致什么调度策略有利？（答案方向：批量摊薄权重搬运）</li>
+            <li>KV Cache 大小的公式是什么？哪个参数来自 GQA（多查询注意力分组）？</li>
+            <li>传统方案的三种浪费分别叫什么？各浪费在哪？</li>
+            <li>vLLM 借鉴了操作系统的什么机制？分别解决了什么问题？</li>
+            <li>一个请求什么时候归还 KV Cache 空间？</li>
+          </ol>
+          <blockquote><p>答不出来的小节回去重读。全答上来，进入第 02 章装环境。</p></blockquote>
+        </div>
+      </details>
+
+      <nav class="pager">
+        <a href="../index.html" title="课程目录"><div class="dir">← 上一章</div><div class="title">课程目录</div></a>
+        <a class="next" href="ch02.html"><div class="dir">下一章 →</div><div class="title">环境安装与第一次推理</div></a>
+      </nav>
+      <footer>vLLM 定制开发教程 · 可视化网页版 ｜ <a href="../index.html">返回目录</a></footer>
+    </article>
+  </div>
+</div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/visuals.js"></script>
+<script src="../assets/js/mathjax-tex-svg.js"></script>
+</body>
+</html>

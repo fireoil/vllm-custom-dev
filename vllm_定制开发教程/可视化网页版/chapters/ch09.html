@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 09 章 · 服务化部署与性能调优 ｜ vLLM 定制开发教程</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+  <a class="brand" href="../index.html">
+    <div class="logo">vLLM 定制开发教程</div>
+    <div class="sub">原理 + 实操，知行合一 · v0.31.0</div>
+  </a>
+  <nav>
+    <a href="../index.html"><span class="ch">🏠</span>课程首页</a>
+    <div class="nav-part">第一部分 · 打地基</div>
+    <a href="ch01.html"><span class="ch">01</span>大模型推理基础</a>
+    <a href="ch02.html"><span class="ch">02</span>环境安装与第一次推理</a>
+    <div class="nav-part">第二部分 · 核心原理</div>
+    <a href="ch03.html"><span class="ch">03</span>整体架构鸟瞰</a>
+    <a href="ch04.html"><span class="ch">04</span>PagedAttention 与 KV Cache</a>
+    <a href="ch05.html"><span class="ch">05</span>调度器与连续批处理</a>
+    <a href="ch06.html"><span class="ch">06</span>一次请求的完整旅程</a>
+    <div class="nav-part">第三部分 · 进阶</div>
+    <a href="ch07.html"><span class="ch">07</span>分布式并行 TP/PP/EP</a>
+    <a href="ch08.html"><span class="ch">08</span>高级特性</a>
+    <a href="ch09.html"><span class="ch">09</span>服务化部署与性能调优</a>
+    <div class="nav-part">第四部分 · 定制</div>
+    <a href="ch10.html"><span class="ch">10</span>接入自己的模型</a>
+    <a href="ch11.html"><span class="ch">11</span>DeepSeek/GLM/Qwen 接入</a>
+    <a href="ch12.html"><span class="ch">12</span>异构硬件部署</a>
+    <a href="ch13.html"><span class="ch">13</span>插件机制实现细节</a>
+    <div class="nav-part">第五部分 · 内核级</div>
+    <a href="ch14.html"><span class="ch">14</span>硬件与模型适配细节</a>
+    <a href="ch15.html"><span class="ch">15</span>性能优化与 TileLang</a>
+    <a href="ch16.html"><span class="ch">16</span>TileLang 内核开发指南</a>
+    <div class="nav-part">资料</div>
+    <a href="appendix.html"><span class="ch">附</span>速查表与常见问题</a>
+  </nav>
+</aside>
+  <div class="main">
+    <div class="topbar">
+      <button class="menu-btn">☰</button>
+      <div class="crumb"><b>第 09 章</b> · 服务化部署与性能调优</div>
+      <div class="reading-progress"></div>
+    </div>
+    <article class="content">
+      <header class="chapter-hero">
+        <div class="kicker">CHAPTER 09</div>
+        <h1>服务化部署与性能调优</h1>
+        <div class="badges"><span class="badge">🔖 vLLM v0.31.0</span><span class="badge lab">🔧 动手实验</span></div>
+        <div class="goal">本章目标：把前 8 章的知识转化为生产力——会压测、会读指标、会按业务调参、会排错。这一章是"面试/工作"高频实战章节。</div>
+      </header>
+
+      <h2><span class="sec-no">9.1</span>服务化部署清单（生产 Checklist）</h2>
+      <div class="code-head"><span>bash · 生产启动命令</span></div>
+      <pre><code class="language-bash">vllm serve &lt;模型&gt; \
+  --host 0.0.0.0 --port 8000 \
+  --max-model-len 8192 \               # 按业务最长上下文设, 不要无脑拉满(吃 KV 座位)
+  --gpu-memory-utilization 0.90 \      # 独占机器可 0.9+; 与其他进程混部要下调
+  --max-num-seqs 256 \                 # 并发上限, 按业务峰值调
+  --enable-prefix-caching \            # 有共同前缀就开(V1 默认开)
+  --disable-log-requests               # 生产关闭请求日志(隐私+性能)</code></pre>
+      <p>其他生产要点：</p>
+      <ul>
+        <li><strong>健康检查</strong>：<code>/health</code> 端点接负载均衡探活；</li>
+        <li><strong>优雅退出</strong>：SIGTERM 会先清空队列；K8s 部署时配好 <code>terminationGracePeriodSeconds</code>；</li>
+        <li><strong>模型放本地盘</strong>：避免运行中从对象存储拉模型（启动风暴）；</li>
+        <li><strong>Docker</strong>：官方镜像 <code>vllm/vllm-openai:v0.31.0</code>，挂载 HF 缓存目录避免重复下载。</li>
+      </ul>
+
+      <h2><span class="sec-no">9.2</span>四个必懂指标（背下来）</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>指标</th><th>全称</th><th>含义</th><th>用户感知</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>TTFT</strong></td><td>Time To First Token</td><td>从发请求到第一个 token 的时间</td><td>"卡了多久开始打字"</td></tr>
+            <tr><td><strong>TPOT</strong></td><td>Time Per Output Token</td><td>平均每个 token 的生成耗时</td><td>"打字快不快"</td></tr>
+            <tr><td><strong>ITL</strong></td><td>Inter-Token Latency</td><td>相邻两个 token 的间隔（逐个测）</td><td>"打字稳不稳"(顿挫感)</td></tr>
+            <tr><td><strong>Throughput</strong></td><td>—</td><td>系统级 tokens/s</td><td>总容量/成本</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p><strong>关键洞察（把前几章串起来）：</strong></p>
+      <ul>
+        <li>TTFT 主要由 <strong>prefill 排队 + prefill 耗时</strong> 决定 → 治理手段：调度预算、chunked prefill、前缀缓存；</li>
+        <li>TPOT/ITL 主要由 <strong>decode 步长 + 每步批大小</strong> 决定 → 治理手段：<code>max_num_seqs</code> 适配、CUDA Graph、投机解码；</li>
+        <li><strong>TTFT 和吞吐此消彼长</strong>：接太多新请求（大 prefill）会拖慢在跑请求的 ITL。调度器的一切预算设计都在平衡这两者。</li>
+      </ul>
+
+      <h2><span class="sec-no">9.3</span>压测：vLLM 自带工具</h2>
+      <div class="code-head"><span>bash</span></div>
+      <pre><code class="language-bash"># 服务端
+vllm serve Qwen/Qwen2.5-0.5B-Instruct --max-model-len 2048 &amp;
+
+# 客户端压测(内置 benchmark 工具, 模拟随机长短的请求)
+vllm bench serve \
+  --backend vllm \
+  --model Qwen/Qwen2.5-0.5B-Instruct \
+  --num-prompts 200 \
+  --request-rate 10        # 每秒 10 个请求, 泊松到达
+
+# 输出会给出: 成功数、吞吐、TTFT 均值/P99、TPOT/P99</code></pre>
+      <p><strong>标准压测流程（面试可直接说）</strong>：</p>
+      <ol>
+        <li>固定 <code>request-rate</code> 从低到高扫（1/5/10/20/50）；</li>
+        <li>每档记录 TTFT-P99、TPOT-P99、吞吐；</li>
+        <li>找到 <strong>TTFT-P99 突破 SLO 的拐点</strong> = 该配置的最大服务容量；</li>
+        <li>改一个参数（如 <code>max-num-seqs</code>）重复，得到最优配置。</li>
+      </ol>
+
+      <h2><span class="sec-no">9.4</span>调优决策树（实战心法）</h2>
+      <div class="code-head"><span>示意 · 调优决策树</span></div>
+      <pre><code class="language-text">吞吐不达标?
+├─ KV blocks 太少(日志里看) → 减 max-model-len / 量化 KV(fp8) / 量化权重
+├─ running 一直 &lt; max-num-seqs → 并发不足, 加大压测速率; 客户端是瓶颈?
+├─ 单步太慢(大批) → 减 max-num-seqs; 开投机解码
+└─ GPU 利用率波动大 → 开 chunked prefill 平滑; 检查是不是 CPU/分词器瓶颈
+
+TTFT 太高?
+├─ prefill 排队 → 加大 max-num-batched-tokens; 长请求切分
+├─ 有共同前缀但没命中 → 检查 prompt 模板是否逐字节一致(第08章)
+└─ 大 prompt 一次塞入 → 开 chunked prefill
+
+ITL 顿挫?
+├─ 长 prefill 插队 → 确认 chunked prefill 生效
+├─ 抢占频繁(日志 grep Preempted) → 减 max-num-seqs 或加显存
+└─ 采样参数复杂(logit_bias 等) → 精简</code></pre>
+
+      <h2><span class="sec-no">9.5</span>排错手册（对照日志）</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>日志/报错</th><th>根因</th><th>处置</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>CUDA out of memory</code> at startup</td><td>utilization 太高 / max-model-len 太大</td><td>下调 utilization；减 max-model-len；第 08 章量化</td></tr>
+            <tr><td><code>Preempted request ... (RECOMPUTE)</code> 刷屏</td><td>KV 块耗尽，抢占风暴</td><td>降并发/降 max-model-len/量化 KV</td></tr>
+            <tr><td><code># GPU blocks</code> 远小于预期</td><td>有别的进程占显存 / utilization 低</td><td><code>nvidia-smi</code> 查占用；独占机器提 utilization</td></tr>
+            <tr><td>输出中文出现"半个字"</td><td>客户端自行拼接 delta 时未处理增量反分词</td><td>使用返回的 <code>delta</code> 全量顺序拼接，别跳帧</td></tr>
+            <tr><td>TTFT 突然飙高</td><td>前缀缓存失效(模板改动) / 有超长请求</td><td>检查 prompt 模板；加 chunked prefill</td></tr>
+            <tr><td><code>ValueError: The model's max seq len is larger than ...</code></td><td>KV 座位装不下 max-model-len</td><td>减 max-model-len 或量化</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2><span class="sec-no">9.6</span>监控与可观测性</h2>
+      <ul>
+        <li><code>/metrics</code> 暴露 Prometheus 指标（请求排队数、运行数、token 计数、缓存命中、各阶段延迟直方图）；</li>
+        <li>最小监控三件套：<code>num_requests_running</code>、<code>num_requests_waiting</code>、TTFT 直方图 P99；</li>
+        <li>Grafana 有社区现成 dashboard，导 vLLM 指标即可。</li>
+      </ul>
+
+      <h2><span class="sec-no">9.7</span>动手实验</h2>
+      <h3>🚀 实验 9-1（必做）：完成一次完整压测报告</h3>
+      <div class="code-head"><span>bash</span></div>
+      <pre><code class="language-bash"># 1. 起服务(记录: # GPU blocks, Maximum concurrency)
+# 2. 三档速率压测, 抄录关键数字:
+vllm bench serve --backend vllm --model Qwen/Qwen2.5-0.5B-Instruct \
+  --num-prompts 100 --request-rate 5
+vllm bench serve --backend vllm --model Qwen/Qwen2.5-0.5B-Instruct \
+  --num-prompts 100 --request-rate 20
+vllm bench serve --backend vllm --model Qwen/Qwen2.5-0.5B-Instruct \
+  --num-prompts 100 --request-rate 50
+# 3. 把 TTFT/TPOT/吞吐 填入表格, 找出你这套配置的容量拐点</code></pre>
+      <h3>🚀 实验 9-2：单参数敏感性</h3>
+      <p>只改 <code>--max-num-seqs</code>（如 16 / 64 / 256）重复实验 9-1，画出"吞吐-延迟"曲线，验证 5.4 参数表的结论：<strong>并发上限是吞吐与单请求延迟之间的旋钮</strong>。</p>
+      <h3>🔬 实验 9-3：复现一次抢占风暴</h3>
+      <p><code>--max-model-len</code> 拉大 + 小 utilization 启动，并发发送多个接近 max 长度的请求，<code>grep Preempted</code> 观察风暴；然后按 9.4 决策树逐项治理，直到日志安静。（这个过程就是生产排错的真实缩影。）</p>
+
+      <h2><span class="sec-no">9.8</span>本章小结 + 自测</h2>
+      <details class="quiz">
+        <summary>📋 本章自测</summary>
+        <div class="quiz-body">
+          <ol>
+            <li>四个指标分别反映什么用户体验？各由哪个阶段主导？</li>
+            <li>为什么说 TTFT 与 ITL 存在天然矛盾？调度器靠什么机制平衡？</li>
+            <li>抢占风暴的三种治理手段？</li>
+            <li>容量规划的完整流程（从压测到拐点）？</li>
+          </ol>
+        </div>
+      </details>
+
+      <nav class="pager">
+        <a href="ch08.html"><div class="dir">← 上一章</div><div class="title">高级特性：投机解码 / 量化 / 结构化输出</div></a>
+        <a class="next" href="ch10.html"><div class="dir">下一章 →</div><div class="title">接入自己的模型</div></a>
+      </nav>
+      <footer>vLLM 定制开发教程 · 可视化网页版 ｜ <a href="../index.html">返回目录</a></footer>
+    </article>
+  </div>
+</div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/visuals.js"></script>
+<script src="../assets/js/mathjax-tex-svg.js"></script>
+</body>
+</html>

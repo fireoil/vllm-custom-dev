@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 08 章 · 高级特性：投机解码 / 量化 / 结构化输出 ｜ vLLM 定制开发教程</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+  <a class="brand" href="../index.html">
+    <div class="logo">vLLM 定制开发教程</div>
+    <div class="sub">原理 + 实操，知行合一 · v0.31.0</div>
+  </a>
+  <nav>
+    <a href="../index.html"><span class="ch">🏠</span>课程首页</a>
+    <div class="nav-part">第一部分 · 打地基</div>
+    <a href="ch01.html"><span class="ch">01</span>大模型推理基础</a>
+    <a href="ch02.html"><span class="ch">02</span>环境安装与第一次推理</a>
+    <div class="nav-part">第二部分 · 核心原理</div>
+    <a href="ch03.html"><span class="ch">03</span>整体架构鸟瞰</a>
+    <a href="ch04.html"><span class="ch">04</span>PagedAttention 与 KV Cache</a>
+    <a href="ch05.html"><span class="ch">05</span>调度器与连续批处理</a>
+    <a href="ch06.html"><span class="ch">06</span>一次请求的完整旅程</a>
+    <div class="nav-part">第三部分 · 进阶</div>
+    <a href="ch07.html"><span class="ch">07</span>分布式并行 TP/PP/EP</a>
+    <a href="ch08.html"><span class="ch">08</span>高级特性</a>
+    <a href="ch09.html"><span class="ch">09</span>服务化部署与性能调优</a>
+    <div class="nav-part">第四部分 · 定制</div>
+    <a href="ch10.html"><span class="ch">10</span>接入自己的模型</a>
+    <a href="ch11.html"><span class="ch">11</span>DeepSeek/GLM/Qwen 接入</a>
+    <a href="ch12.html"><span class="ch">12</span>异构硬件部署</a>
+    <a href="ch13.html"><span class="ch">13</span>插件机制实现细节</a>
+    <div class="nav-part">第五部分 · 内核级</div>
+    <a href="ch14.html"><span class="ch">14</span>硬件与模型适配细节</a>
+    <a href="ch15.html"><span class="ch">15</span>性能优化与 TileLang</a>
+    <a href="ch16.html"><span class="ch">16</span>TileLang 内核开发指南</a>
+    <div class="nav-part">资料</div>
+    <a href="appendix.html"><span class="ch">附</span>速查表与常见问题</a>
+  </nav>
+</aside>
+  <div class="main">
+    <div class="topbar">
+      <button class="menu-btn">☰</button>
+      <div class="crumb"><b>第 08 章</b> · 高级特性</div>
+      <div class="reading-progress"></div>
+    </div>
+    <article class="content">
+      <header class="chapter-hero">
+        <div class="kicker">CHAPTER 08</div>
+        <h1>高级特性：Chunked Prefill、投机解码、量化、结构化输出、LoRA</h1>
+        <div class="badges"><span class="badge">🔖 vLLM v0.31.0</span><span class="badge lab">🔧 动手实验</span></div>
+        <div class="goal">本章目标：掌握 vLLM 五大"加速/增强开关"的原理与用法。每个特性都遵循：问题 → 原理 → 用法 → 实验观察。</div>
+      </header>
+
+      <h2><span class="sec-no">8.1</span>Chunked Prefill（V1 默认开启）</h2>
+      <p><strong>问题</strong>：一个 20000 token 的 prompt 若一步 prefill，会霸占 GPU 数百毫秒，同一时间所有 decode 请求的流式输出全部卡顿（第 05 章已预告）。</p>
+      <p><strong>原理</strong>：调度器把超长 prompt 按 <code>--max-num-batched-tokens</code> 预算切片，多步内分批算完。切片期间还能与其他请求的 decode <strong>混批</strong>，GPU 利用率更平滑。</p>
+      <p><strong>用法</strong>（默认开，一般不用动）：</p>
+      <div class="code-head"><span>bash</span></div>
+      <pre><code class="language-bash">vllm serve Qwen/Qwen2.5-0.5B-Instruct --max-num-partial-prefills 2   # 允许 2 个长请求同时切片</code></pre>
+      <p><strong>观察</strong>：用长 prompt + 流式请求，对比开启/关闭时打字机是否顿挫。</p>
+
+      <h2><span class="sec-no">8.2</span>前缀缓存进阶（第 04 章的延伸）</h2>
+      <p>V1 默认 <code>--enable-prefix-caching</code>。三个进阶用法：</p>
+      <div class="code-head"><span>bash</span></div>
+      <pre><code class="language-bash"># ① 多轮对话场景天然受益: 每轮对话的前缀 = 上一轮的完整上下文
+# ② 配合 --num-gpu-blocks-override 手动固定块数做容量规划
+# ③ 查命中率: /metrics 里的 cache 相关指标, 或日志 "Prefix caching"</code></pre>
+      <p><strong>踩坑提示</strong>：请求间前缀缓存命中要求 token 完全一致——<strong>温度、采样参数不同不影响，但 prompt 开头哪怕差一个空格都会 miss</strong>。模板化的 prompt（如 RAG 固定文档段）要放在开头。</p>
+
+      <h2><span class="sec-no">8.3</span>投机解码（Speculative Decoding）：用"猜"换速度</h2>
+      <p><strong>问题</strong>：decode 每步只出 1 个 token，却要搬一次全部权重（访存瓶颈），小算量大搬运，GPU 计算单元大量闲置。</p>
+      <p><strong>原理</strong>：请一个便宜的"草稿模型"（或 n-gram 表）先<strong>连猜 k 个 token</strong>，再让大模型<strong>一步并行验证</strong>这 k 个——被接受的直接采纳，猜错处回退。一次前向搬运权重，产出多个 token，<strong>数学上输出分布与不用它时完全一致</strong>（这是关键，纯赚不亏）。</p>
+      <div class="code-head"><span>示意 · 草稿-验证一轮</span></div>
+      <pre><code class="language-text">草稿(小模型/ngram): 猜 "天/空/很/蓝"     (极快)
+目标(大模型):       一次前向同时验证 4 个  (成本≈原本1步)
+结果: 接受 "天空很" 拒绝 "蓝" → 本步产出 3 个 token, 3倍速!</code></pre>
+      <p>vLLM v0.31 支持多种草稿方式（<code>vllm/v1/spec_decode/</code>）：<strong>n-gram</strong>（零成本、适合翻译/代码等重复模式多的任务）、<strong>小模型草稿</strong>（EAGLE 系列、Medusa 等）。</p>
+      <p><strong>用法</strong>：</p>
+      <div class="code-head"><span>bash</span></div>
+      <pre><code class="language-bash"># n-gram 投机: 最容易上手
+vllm serve Qwen/Qwen2.5-7B-Instruct \
+  --speculative-config '{"method": "ngram", "num_speculative_tokens": 5}'</code></pre>
+      <p><strong>观察</strong>：压测对比开启前后吞吐；日志会报告<strong>接受率（acceptance rate）</strong>——任务可预测性越高（代码补全/固定格式）收益越大，创意写作收益低甚至负收益。</p>
+      <div class="viz" data-viz="spec-decode">
+        <div class="viz-head"><span class="dot"></span><span class="title">投机解码：草稿-验证博弈</span><span class="desc">动画演示"连猜 k 个 → 一步验证 → 采纳/回退"</span></div>
+        <div class="viz-body"></div>
+      </div>
+
+      <h2><span class="sec-no">8.4</span>量化：显存不够的第一反应</h2>
+      <p><strong>原理</strong>：把 FP16 权重压到更低比特（FP8/INT8/INT4），显存和带宽都省 2~4 倍。KV Cache 也能量化（<code>--kv-cache-dtype fp8</code>），直接让"座位"翻倍。</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>方案</th><th>特点</th><th>用法</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>FP8</strong></td><td>近乎无损、NVIDIA Hopper/Ada+ 硬件原生支持，<strong>首选</strong></td><td><code>--quantization fp8</code>（或直接加载官方 FP8 模型）</td></tr>
+            <tr><td><strong>AWQ</strong></td><td>4bit，精度好，需预量化模型</td><td>直接加载 <code>*-AWQ</code> 命名的模型</td></tr>
+            <tr><td><strong>GPTQ</strong></td><td>4bit，生态成熟</td><td>直接加载 <code>*-GPTQ</code> 模型</td></tr>
+            <tr><td><strong>bitsandbytes</strong></td><td>8/4bit 在线量化（对任意 HF 模型即拿即用，速度一般）</td><td><code>--quantization bitsandbytes</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="viz" data-viz="bar-compare">
+        <div class="viz-head"><span class="dot"></span><span class="title">量化档位对比 · 每权重比特数</span><span class="desc">数值取自 8.4 正文：FP16 → FP8/INT8 → INT4</span></div>
+        <div class="viz-body"></div>
+        <script type="application/json" class="viz-cfg">{"unit":" bit","note":"比特数减半，显存与带宽占用同比例下降——正文：显存和带宽都省 2~4 倍；KV Cache 量化（--kv-cache-dtype fp8）还能让「座位」翻倍。","items":[
+{"label":"FP16（原始权重）","value":16,"color":"#4f9cf9"},
+{"label":"FP8 / INT8","value":8,"color":"#f59e0b"},
+{"label":"AWQ / GPTQ（4bit）","value":4,"color":"#22c55e"}
+]}</script>
+      </div>
+      <p><strong>实操</strong>（8GB 卡跑 7B 的正确姿势——不用并行，不用租卡）：</p>
+      <div class="code-head"><span>bash</span></div>
+      <pre><code class="language-bash">vllm serve Qwen/Qwen2.5-7B-Instruct-AWQ --max-model-len 4096
+# 或在线压 FP8(需要较新显卡):
+vllm serve Qwen/Qwen2.5-7B-Instruct --quantization fp8</code></pre>
+      <p><strong>决策链</strong>：权重放不下 → AWQ/FP8；KV 放不下 → <code>--kv-cache-dtype fp8</code>；两者可叠加。</p>
+
+      <h2><span class="sec-no">8.5</span>结构化输出（Structured Output）：让模型只吐合法 JSON</h2>
+      <p><strong>问题</strong>：让模型输出 JSON，它时不时多句嘴或括号不配对，下游程序崩溃。</p>
+      <p><strong>原理</strong>（<code>vllm/v1/structured_output/</code>）：把输出文法（JSON Schema）编译成<strong>状态机/自动机</strong>，每步解码前，把"不合语法"的 token 的 logits 强制置为 -inf——模型只能在合法 token 里选。v0.31 默认用 <strong>xgrammar</strong> 引擎，速度快。</p>
+      <p><strong>用法</strong>（OpenAI 兼容）：</p>
+      <div class="code-head"><span>bash · curl</span></div>
+      <pre><code class="language-bash">curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "messages": [{"role":"user","content": "给一个学生打分: 张三 数学90 语文85"}],
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {"name":"score", "schema":{
+      "type":"object",
+      "properties":{"name":{"type":"string"},"math":{"type":"number"},"chinese":{"type":"number"}},
+      "required":["name","math","chinese"]}}}}'</code></pre>
+      <p><strong>代价</strong>：约束编译有一次性开销（自动缓存）；过度复杂的 schema 会拉高 TTFT。注意引导词（guided json）本质是"限制"，模型的语义质量仍取决于模型本身。</p>
+
+      <h2><span class="sec-no">8.6</span>LoRA 服务：一个基座带多个"角色"</h2>
+      <p><strong>原理</strong>：LoRA 是在原模型旁挂的低秩小矩阵（几十 MB），vLLM 可以在<strong>一个引擎里同时热插拔多个 LoRA 适配器</strong>，按请求路由。</p>
+      <div class="code-head"><span>bash</span></div>
+      <pre><code class="language-bash">vllm serve Qwen/Qwen2.5-7B-Instruct \
+  --enable-lora --max-lora-rank 64 --max-loras 4 \
+  --lora-modules customer-service=/path/lora-cs translator=/path/lora-tr
+
+# 请求时指定用哪个适配器:
+curl ... -d '{"model":"customer-service", "messages":[...]}'</code></pre>
+      <p>适用：多业务共享一个基座省显存；LoRA 切换有轻微开销，超多适配器时留意。</p>
+
+      <h2><span class="sec-no">8.7</span>动手实验汇总</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>实验</th><th>命令</th><th>观察点</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>🔧 投机解码 n-gram</td><td>上文 serve 命令 + 压测脚本</td><td>吞吐变化、acceptance rate</td></tr>
+            <tr><td>🚀 FP8/AWQ</td><td>8GB 卡跑 7B-AWQ 成功</td><td>日志权重体积 ÷2；KV blocks 变化</td></tr>
+            <tr><td>🚀 KV 量化</td><td><code>--kv-cache-dtype fp8</code> 重启</td><td><code># GPU blocks</code> 几乎翻倍</td></tr>
+            <tr><td>🔬 结构化输出</td><td>上文 curl</td><td>输出 100% 合法 JSON；重复多次对比</td></tr>
+            <tr><td>🔬 LoRA</td><td>上文 serve + 两个请求打不同 model</td><td>同一服务两个"人格"</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <blockquote>
+        <p>投机解码与量化实验建议在能跑 7B 的环境做；8GB 小卡可用 0.5B 模型验证流程正确性。</p>
+      </blockquote>
+
+      <h2><span class="sec-no">8.8</span>本章小结 + 自测</h2>
+      <details class="quiz">
+        <summary>📋 本章自测</summary>
+        <div class="quiz-body">
+          <ol>
+            <li>投机解码为什么"不亏"？什么任务上它会变慢？</li>
+            <li>FP8 和 AWQ 分别量化了什么？KV Cache 量化解决的是哪个资源瓶颈？</li>
+            <li>前缀缓存 miss 的最常见原因是什么？</li>
+            <li>结构化输出的实现机制是"事后修复"还是"解码时约束"？</li>
+            <li>你的业务：RAG 问答（固定长文档+短问题），优先打开哪些开关？（答案：前缀缓存 + chunked prefill + 必要时 FP8）</li>
+          </ol>
+        </div>
+      </details>
+
+      <nav class="pager">
+        <a href="ch07.html"><div class="dir">← 上一章</div><div class="title">分布式并行 TP/PP/EP</div></a>
+        <a class="next" href="ch09.html"><div class="dir">下一章 →</div><div class="title">服务化部署与性能调优</div></a>
+      </nav>
+      <footer>vLLM 定制开发教程 · 可视化网页版 ｜ <a href="../index.html">返回目录</a></footer>
+    </article>
+  </div>
+</div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/visuals.js"></script>
+<script src="../assets/js/mathjax-tex-svg.js"></script>
+</body>
+</html>

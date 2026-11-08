@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 11 章 · 主流模型接入：DeepSeek / GLM / Qwen ｜ vLLM 定制开发教程</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+  <a class="brand" href="../index.html">
+    <div class="logo">vLLM 定制开发教程</div>
+    <div class="sub">原理 + 实操，知行合一 · v0.31.0</div>
+  </a>
+  <nav>
+    <a href="../index.html"><span class="ch">🏠</span>课程首页</a>
+    <div class="nav-part">第一部分 · 打地基</div>
+    <a href="ch01.html"><span class="ch">01</span>大模型推理基础</a>
+    <a href="ch02.html"><span class="ch">02</span>环境安装与第一次推理</a>
+    <div class="nav-part">第二部分 · 核心原理</div>
+    <a href="ch03.html"><span class="ch">03</span>整体架构鸟瞰</a>
+    <a href="ch04.html"><span class="ch">04</span>PagedAttention 与 KV Cache</a>
+    <a href="ch05.html"><span class="ch">05</span>调度器与连续批处理</a>
+    <a href="ch06.html"><span class="ch">06</span>一次请求的完整旅程</a>
+    <div class="nav-part">第三部分 · 进阶</div>
+    <a href="ch07.html"><span class="ch">07</span>分布式并行 TP/PP/EP</a>
+    <a href="ch08.html"><span class="ch">08</span>高级特性</a>
+    <a href="ch09.html"><span class="ch">09</span>服务化部署与性能调优</a>
+    <div class="nav-part">第四部分 · 定制</div>
+    <a href="ch10.html"><span class="ch">10</span>接入自己的模型</a>
+    <a href="ch11.html"><span class="ch">11</span>DeepSeek/GLM/Qwen 接入</a>
+    <a href="ch12.html"><span class="ch">12</span>异构硬件部署</a>
+    <a href="ch13.html"><span class="ch">13</span>插件机制实现细节</a>
+    <div class="nav-part">第五部分 · 内核级</div>
+    <a href="ch14.html"><span class="ch">14</span>硬件与模型适配细节</a>
+    <a href="ch15.html"><span class="ch">15</span>性能优化与 TileLang</a>
+    <a href="ch16.html"><span class="ch">16</span>TileLang 内核开发指南</a>
+    <div class="nav-part">资料</div>
+    <a href="appendix.html"><span class="ch">附</span>速查表与常见问题</a>
+  </nav>
+</aside>
+  <div class="main">
+    <div class="topbar">
+      <button class="menu-btn">☰</button>
+      <div class="crumb"><b>第 11 章</b> · DeepSeek/GLM/Qwen 接入</div>
+      <div class="reading-progress"></div>
+    </div>
+    <article class="content">
+      <header class="chapter-hero">
+        <div class="kicker">CHAPTER 11</div>
+        <h1>主流模型接入：DeepSeek / GLM / Qwen 实现细节</h1>
+        <div class="badges"><span class="badge">🔖 vLLM v0.31.0</span><span class="badge lab">🔧 动手实验</span></div>
+        <div class="goal">本章目标：以国内三大主力模型家族为样本，讲清"一个模型家族在 vLLM 里是怎么被支持的"——涉及注意力变体（GQA/MLA）、MoE、MTP 投机解码、专属量化。学完你能独立为任意一家模型选对启动参数、定位它的源码实现、判断"能不能跑在我的卡上"。（文件路径均对照 vLLM v0.31.0 源码树逐一核实）</div>
+      </header>
+
+<h2><span class="sec-no">11.0</span>三大家族在源码里的"户口本"</h2>
+<p>vLLM 按模型家族分文件实现（<code>vllm/model_executor/models/</code>）。三家的核心文件：</p>
+<div class="table-wrap"><table>
+<thead><tr><th>家族</th><th>密集模型</th><th>MoE 模型</th><th>多模态</th><th>MTP/投机</th></tr></thead>
+<tbody>
+<tr><td><strong>Qwen</strong></td><td><code>qwen2.py</code>（Qwen2/2.5）、<code>qwen3.py</code></td><td><code>qwen2_moe.py</code>、<code>qwen3_moe.py</code>、<code>qwen3_next.py</code></td><td><code>qwen2_5_vl.py</code>、<code>qwen2_vl.py</code>、<code>qwen3_vl.py</code></td><td><code>qwen3_next_mtp.py</code>、<code>qwen3_5_mtp.py</code></td></tr>
+<tr><td><strong>GLM</strong></td><td><code>glm4.py</code>（GLM-4 系列）、<code>chatglm.py</code>（早期）</td><td><code>glm4_moe.py</code>（GLM-4.5/4.6 系）、<code>glm4_moe_lite.py</code></td><td><code>glm4v.py</code>、<code>glm4_1v.py</code></td><td><code>glm4_moe_mtp.py</code>、<code>glm4_moe_lite_mtp.py</code></td></tr>
+<tr><td><strong>DeepSeek</strong></td><td>—（全线 MoE）</td><td><code>deepseek_v2.py</code>（<strong>V2/V3/R1 共用此实现</strong>）</td><td><code>deepseek_vl2.py</code></td><td><code>deepseek_mtp.py</code>、<code>deepseek_eagle3.py</code></td></tr>
+</tbody>
+</table></div>
+<p><strong>怎么知道自己手里的模型用的是哪个实现？</strong>看 HuggingFace 仓库 <code>config.json</code> 的 <code>architectures</code> 字段，例如：</p>
+<div class="table-wrap"><table>
+<thead><tr><th>模型</th><th>config.json 里的 architectures</th><th>对应 vLLM 实现</th></tr></thead>
+<tbody>
+<tr><td>Qwen2.5-7B-Instruct</td><td><code>Qwen2ForCausalLM</code></td><td><code>qwen2.py</code></td></tr>
+<tr><td>Qwen3-30B-A3B</td><td><code>Qwen3MoeForCausalLM</code></td><td><code>qwen3_moe.py</code></td></tr>
+<tr><td>GLM-4-9B-Chat</td><td><code>Glm4ForCausalLM</code></td><td><code>glm4.py</code></td></tr>
+<tr><td>GLM-4.5-Air</td><td><code>Glm4MoeForCausalLM</code></td><td><code>glm4_moe.py</code></td></tr>
+<tr><td>DeepSeek-R1</td><td><code>DeepseekV3ForCausalLM</code></td><td><code>deepseek_v2.py</code></td></tr>
+</tbody>
+</table></div>
+<blockquote>vLLM 启动时拿 <code>architectures</code> 去<strong>模型注册表</strong>（<code>registry.py</code>）查实现类——这正是第 10 章"新模型四步接入"的另一半：三大家族都已经注册过了，你只要装对版本。</blockquote>
+
+<h2><span class="sec-no">11.1</span>Qwen 家族：最"标准"的接入，五种形态</h2>
+<p>Qwen 系是学习 vLLM 模型实现的最佳教材，因为它覆盖了全部主流形态：</p>
+<ol>
+<li><strong>Dense（Qwen2/2.5/3）</strong>：标准 GQA 注意力 —— 第 01 章公式直接适用；</li>
+<li><strong>MoE（Qwen3-MoE 等）</strong>：FFN 换成路由 + 专家（第 07 章 EP 的应用场景）；</li>
+<li><strong>混合架构（Qwen3-Next）</strong>：部分层用<strong>门控 DeltaNet（GDN，线性注意力）</strong>替代标准注意力 → 对应 vLLM 专门的混合注意力后端（<code>v1/attention/backends/gdn_attn.py</code>、<code>linear_attn.py</code>），KV 显存模式与纯注意力模型完全不同；</li>
+<li><strong>多模态 VL</strong>：视觉编码器 + LLM，vLLM 的 multimodal 输入管线（图像会被编码成 embed 后拼进序列）；</li>
+<li><strong>MTP</strong>：官方训练了投机解码用的小模块（见 11.4）。</li>
+</ol>
+<p><strong>实操（你的 8GB 卡能直接跑的）：</strong></p>
+<div class="code-head"><span>bash</span></div>
+<pre><code class="language-bash"># Qwen2.5 / Qwen3 小尺寸 dense —— 全功能体验
+vllm serve Qwen/Qwen2.5-0.5B-Instruct --max-model-len 2048
+vllm serve Qwen/Qwen3-1.7B --max-model-len 4096   # Qwen3 默认带思考模式, 见下
+
+# 关闭思考模式（Qwen3 特性, 通过 chat template kwargs 控制）
+vllm serve Qwen/Qwen3-1.7B --max-model-len 4096 \
+  --chat-template-content-format string
+# 请求时: "chat_template_kwargs": {"enable_thinking": false}</code></pre>
+<p><strong>Qwen3 特有注意点</strong>：输出里会出现 <code>&lt;think&gt;...&lt;/think&gt;</code> 段（思考过程）。API 层可用 <code>reasoning parser</code> 分离（<code>--enable-reasoning --reasoning-parser deepseek_r1</code>，兼容 Qwen3 的格式）——这是"接入新模型 = 模型代码 + 服务层特性"两层配合的典型例子。</p>
+
+<h2><span class="sec-no">11.2</span>GLM 家族：从 Dense 到 MoE 的演进</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>模型</th><th>架构</th><th>vLLM 要点</th></tr></thead>
+<tbody>
+<tr><td>ChatGLM/GLM-2/3</td><td><code>chatglm.py</code></td><td>老架构，新项目不建议</td></tr>
+<tr><td>GLM-4-9B / GLM-4-32B</td><td><code>glm4.py</code></td><td>标准 GQA dense；9B fp16 需 ~19GB，8GB 卡请用 AWQ 版</td></tr>
+<tr><td>GLM-4.5 / GLM-4.6</td><td><code>glm4_moe.py</code></td><td>MoE + <strong>官方 MTP 模块</strong>（<code>glm4_moe_mtp.py</code>）</td></tr>
+<tr><td>GLM-4V / 4.1V</td><td><code>glm4v.py</code> / <code>glm4_1v.py</code></td><td>视觉版本</td></tr>
+</tbody>
+</table></div>
+<p><strong>实操：</strong></p>
+<div class="code-head"><span>bash</span></div>
+<pre><code class="language-bash"># 8GB 卡: GLM-4-9B 走 AWQ 量化(第08章: 能量化先量化)
+vllm serve zai-org/glm-4-9b-chat-awq --max-model-len 4096
+
+# 多卡: GLM-4.5-Air(106B MoE) 在 4×A100 级别机器
+vllm serve zai-org/GLM-4.5-Air \
+  --tensor-parallel-size 4 \
+  --speculative-config '{"method":"glm4_mtp","num_speculative_tokens":1}'</code></pre>
+<blockquote>GLM-4.5/4.6 系的 MTP 以官方提供的 mtp 模块（<code>glm4_moe_mtp.py</code>）实现投机解码——用法是在 <code>--speculative-config</code> 里指定对应 method。<strong>方法名以你版本的 vLLM 文档为准</strong>（<code>python -c "from vllm.v1.spec_decode import ..."</code> 或官方 speculative decoding 文档页可查）。</blockquote>
+
+<h2><span class="sec-no">11.3</span>DeepSeek 家族：MLA 是重头戏</h2>
+<h3>MLA（Multi-head Latent Attention）：KV Cache 的极限压缩</h3>
+<p>DeepSeek-V2/V3/R1 的核心创新不是 MoE（业界已有），而是 <strong>MLA 注意力</strong>：</p>
+<p><strong>问题</strong>：DeepSeek-V3 是 671B、61 层的大模型，若用传统 GQA，每 token 的 KV 缓存即使压缩也很可观，多机部署时 KV 显存成为最大瓶颈。</p>
+<p><strong>方案</strong>：把每层的 KV <strong>压缩成一个低维"潜在向量"（latent，512 维）+ 64 维 rope 位置向量</strong>，只缓存这 576 维；注意力时再从中解压出 K/V。</p>
+<div class="code-head"><span>text · GQA vs MLA 显存对比示意</span></div>
+<pre><code>传统 GQA:  缓存 K、V 全量      → KV大小 ∝ 层数 × kv头数 × head_dim × 2
+MLA:       缓存 latent(512) + rope(64) = 576 维/层/token
+           → 61 层 × 576 × 2B ≈ 70 KB/token (fp16)
+           → 对比: 若该模型用普通 MHA 将达到数 MB/token, MLA 压缩一个数量级</code></pre>
+<p><strong>vLLM 的落地（v0.31.0）</strong>：<code>v1/attention/backends/mla/</code> 目录下有<strong>一整族 MLA 内核</strong>，按显卡代际/后端自动或手动选择：</p>
+<div class="table-wrap"><table>
+<thead><tr><th>内核文件</th><th>适用</th></tr></thead>
+<tbody>
+<tr><td><code>flashmla.py</code></td><td>DeepSeek 官方 FlashMLA 内核（Hopper 首选之一）</td></tr>
+<tr><td><code>cutlass_mla.py</code></td><td>CUTLASS 实现</td></tr>
+<tr><td><code>flashattn_mla.py</code> / <code>flashinfer_mla.py</code></td><td>FlashAttention / FlashInfer 路线</td></tr>
+<tr><td><code>triton_mla.py</code>、<code>aiter_triton_mla.py</code></td><td>Triton / AMD ROCm 路线</td></tr>
+<tr><td><code>amx_mla.py</code>、<code>cpu_mla.py</code></td><td>CPU 路线（AMX 指令集）</td></tr>
+</tbody>
+</table></div>
+<blockquote>这就是第 12 章"硬件插件"与模型实现的交汇处：<strong>同一个模型，不同硬件走不同内核</strong>，由 <code>Platform</code> 与 <code>--attention-backend</code> 类参数仲裁。</blockquote>
+<h3>FP8 块级量化（DeepSeek 官方权重自带）</h3>
+<p>DeepSeek-V3/R1 官方权重就是 <strong>FP8 block-wise（128×128 分块）</strong>量化格式，vLLM 原生支持（<code>model_executor/layers/quantization/fp8.py</code> 一族），加载即用，无需再选 <code>--quantization</code>（config 里的 <code>quantization_config</code> 自动生效）。</p>
+<h3>实操</h3>
+<div class="code-head"><span>bash</span></div>
+<pre><code class="language-bash"># DeepSeek 是 671B 级 MoE, 本教程 8GB 卡无法本地运行, 给生产参考:
+# 单机 8×H200/H20 (FP8 权重 + MTP 投机):
+vllm serve deepseek-ai/DeepSeek-V3 \
+  --tensor-parallel-size 8 \
+  --max-model-len 32768 \
+  --speculative-config '{"method":"deepseek_mtp","num_speculative_tokens":1}'
+
+# R1 蒸馏版(Qwen/Llama 底座)在本教程机器可跑蒸馏小尺寸:
+vllm serve deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --max-model-len 4096</code></pre>
+<p><strong>DeepSeek 系列三大招牌特性与 vLLM 支持对照：</strong></p>
+<div class="table-wrap"><table>
+<thead><tr><th>特性</th><th>原理</th><th>vLLM 支持</th></tr></thead>
+<tbody>
+<tr><td>MLA</td><td>KV 压缩为 576 维 latent</td><td>专属 MLA 后端族（见上表）</td></tr>
+<tr><td>MoE + 无辅助损失负载均衡</td><td>256 专家选 8</td><td>MoE 层 + EP 并行（第 07 章）</td></tr>
+<tr><td>MTP</td><td>训练时多 token 预测头, 推理时做投机解码</td><td><code>deepseek_mtp.py</code> + speculative-config</td></tr>
+</tbody>
+</table></div>
+<div class="viz" data-viz="arch-diagram">
+  <div class="viz-head"><span class="dot"></span><span class="title">DeepSeek-V3/R1 模块构成与 vLLM 支持</span><span class="desc">MLA 注意力 + MoE FFN + MTP 头，点击查看源码要点 · 对应 11.3 节</span></div>
+  <div class="viz-body"></div>
+  <script type="application/json" class="viz-cfg">{"layers":[
+    {"name":"注意力层 · MLA（Multi-head Latent Attention）","color":"#4f9cf9","items":[
+      {"name":"latent 512 维","desc":"把每层 KV 压缩成一个低维\"潜在向量\"，注意力时再从中解压出 K/V"},
+      {"name":"rope 64 维","desc":"位置向量与 latent 一起缓存，共 576 维/层/token"},
+      {"name":"≈70 KB/token","desc":"61 层 × 576 × 2B（fp16）；若用普通 MHA 将达数 MB/token，MLA 压缩一个数量级"},
+      {"name":"MLA 内核族","desc":"v1/attention/backends/mla/ 下按显卡代际/后端选择：flashmla / cutlass_mla / flashattn_mla / flashinfer_mla / triton_mla / aiter_triton_mla(AMD) / amx_mla / cpu_mla"}]},
+    {"name":"FFN 层 · MoE（256 专家选 8）","color":"#a78bfa","items":[
+      {"name":"无辅助损失负载均衡","desc":"DeepSeek 自研的 MoE 路由负载均衡方案"},
+      {"name":"MoE 层 + EP 并行","desc":"vLLM 的 MoE 层支持，专家并行见第 07 章"},
+      {"name":"FP8 块级量化","desc":"官方权重自带 FP8 block-wise（128×128 分块），config 的 quantization_config 自动生效"}]},
+    {"name":"MTP 头 · 官方投机解码","color":"#22c55e","items":[
+      {"name":"deepseek_mtp.py","desc":"主模型自带的 1 层多 token 预测小模块，权重随主模型一起分发"},
+      {"name":"speculative-config","desc":"--speculative-config 指定 method 与 num_speculative_tokens"},
+      {"name":"更高接受率","desc":"对比独立草稿模型的 60~80% 接受率；代码/翻译类任务收益大，闲聊收益小"}]}
+  ]}</script>
+</div>
+
+<h2><span class="sec-no">11.4</span>MTP：三大厂殊途同归的"官方投机解码"</h2>
+<p>对照第 08 章的投机解码原理：草稿模型的质量决定接受率。<strong>MTP（Multi-Token Prediction）</strong>是"官方草稿"——主模型训练时就多带了一个"预测下一个 token"的小模块，推理时把它当草稿模型用：</p>
+<div class="code-head"><span>text · 普通投机 vs MTP 对比示意</span></div>
+<pre><code>普通投机:  独立小模型猜 → 接受率 60~80%, 且要额外下载/维护草稿模型
+MTP:       主模型自带的 1 层小模块猜 → 接受率更高, 权重随主模型一起分发</code></pre>
+<p>三家的 MTP 实现文件（v0.31.0）：<code>deepseek_mtp.py</code>、<code>glm4_moe_mtp.py</code>、<code>qwen3_next_mtp.py</code>。<strong>共同使用姿势</strong>：<code>--speculative-config '{"method":"&lt;对应方法&gt;","num_speculative_tokens":N}'</code>。</p>
+<p><strong>收益观察点</strong>（做实验时看）：日志中的 acceptance rate；代码/翻译类任务收益大，闲聊收益小。</p>
+
+<h2><span class="sec-no">11.5</span>三家横向对比与选型</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>维度</th><th>Qwen</th><th>GLM</th><th>DeepSeek</th></tr></thead>
+<tbody>
+<tr><td>注意力</td><td>GQA（主流）/GDN（Next 系）</td><td>GQA</td><td><strong>MLA</strong></td></tr>
+<tr><td>MoE</td><td>Qwen3-MoE / Next</td><td>GLM-4.5/4.6 系</td><td>全线（V3 起）</td></tr>
+<tr><td>官方投机</td><td>MTP（Next/3.5 系）</td><td>MTP</td><td>MTP</td></tr>
+<tr><td>量化生态</td><td>AWQ/GPTQ/FP8 全套</td><td>AWQ 为主</td><td>官方 FP8 block</td></tr>
+<tr><td>小显存入门型号</td><td>Qwen2.5-0.5B、Qwen3-1.7B</td><td>glm-4-9b-chat-awq</td><td>R1-Distill-Qwen-1.5B</td></tr>
+</tbody>
+</table></div>
+<p><strong>选型速断</strong>：小显存/端侧 → Qwen dense 系；企业级中尺寸 → GLM-4 dense 或 Qwen3；超大参数池化成本 → DeepSeek / 各家 MoE 大杯。</p>
+
+<h2><span class="sec-no">11.6</span>动手实验</h2>
+<p>✅ <strong>实验 11-1（必做）</strong>：查模型注册表，亲眼确认三家的"户口"：</p>
+<div class="code-head"><span>bash</span></div>
+<pre><code class="language-bash">python3 -c "
+from vllm.model_executor.models.registry import ModelRegistry
+archs = ModelRegistry.get_supported_archs()
+for kw in ['Qwen', 'Glm', 'Deepseek']:
+    hits = [a for a in archs if kw.lower() in a.lower()]
+    print(kw, '→', len(hits), '个架构')
+    print('  ', hits[:8])
+"</code></pre>
+<p>✅ <strong>实验 11-2（8GB 卡真机）</strong>：跑 Qwen3，观察思考模式：</p>
+<div class="code-head"><span>bash</span></div>
+<pre><code class="language-bash">vllm serve Qwen/Qwen3-1.7B --max-model-len 4096
+# 另开终端, 请求体加 "chat_template_kwargs": {"enable_thinking": true}
+# 对比开/关思考: 输出中 &lt;think&gt; 段的有无、TTFT 差异(思考=更长的 prefill!)</code></pre>
+<p>✅ <strong>实验 11-3（纸上推演）</strong>：手算 MLA 显存收益。DeepSeek-V3：61 层、MLA latent 512+rope 64、fp16。算每 token KV；再假设它用 8 个 KV 头 GQA（head_dim 128），算同样指标，对比倍数。（这一题做完，你就真正"拥有"了 11.3 的内容。）</p>
+<p>🔬 <strong>实验 11-4（选做，源码走读）</strong>：对照第 10 章四步法精读 <code>qwen2.py</code>（仅数百行），画出它的模块组成（Embedding → 28 层 DecoderLayer(Attention+MLP) → lm_head），再打开 <code>glm4.py</code> diff 一下——你会发现 90% 相同。<strong>模型实现之间确实是互相"抄"的。</strong></p>
+
+<h2><span class="sec-no">11.7</span>本章小结 + 自测</h2>
+<details class="quiz">
+<summary>📋 本章自测</summary>
+<div class="quiz-body">
+<ol>
+<li>vLLM 靠 config.json 的哪个字段路由到模型实现？三家的 MoE 模型架构名分别是什么？</li>
+<li>MLA 缓存的是什么？大概把 KV 压缩到传统方案的几分之一（量级）？</li>
+<li>MTP 与普通投机解码的差异？为什么接受率更高？</li>
+<li>Qwen3-Next 的混合注意力对 KV Cache 管理提出了什么新挑战？</li>
+<li>你的 8GB 卡上，三家各能跑哪个型号？</li>
+</ol>
+</div>
+</details>
+
+      <nav class="pager">
+        <a href="ch10.html"><div class="dir">← 上一章</div><div class="title">定制开发：接入自己的模型</div></a>
+        <a class="next" href="ch12.html"><div class="dir">下一章 →</div><div class="title">异构硬件部署指南</div></a>
+      </nav>
+      <footer>vLLM 定制开发教程 · 可视化网页版 ｜ <a href="../index.html">返回目录</a></footer>
+    </article>
+  </div>
+</div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/visuals.js"></script>
+<script src="../assets/js/mathjax-tex-svg.js"></script>
+</body>
+</html>

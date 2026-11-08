@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>附录 · 速查表与常见问题 ｜ vLLM 定制开发教程</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+  <a class="brand" href="../index.html">
+    <div class="logo">vLLM 定制开发教程</div>
+    <div class="sub">原理 + 实操，知行合一 · v0.31.0</div>
+  </a>
+  <nav>
+    <a href="../index.html"><span class="ch">🏠</span>课程首页</a>
+    <div class="nav-part">第一部分 · 打地基</div>
+    <a href="ch01.html"><span class="ch">01</span>大模型推理基础</a>
+    <a href="ch02.html"><span class="ch">02</span>环境安装与第一次推理</a>
+    <div class="nav-part">第二部分 · 核心原理</div>
+    <a href="ch03.html"><span class="ch">03</span>整体架构鸟瞰</a>
+    <a href="ch04.html"><span class="ch">04</span>PagedAttention 与 KV Cache</a>
+    <a href="ch05.html"><span class="ch">05</span>调度器与连续批处理</a>
+    <a href="ch06.html"><span class="ch">06</span>一次请求的完整旅程</a>
+    <div class="nav-part">第三部分 · 进阶</div>
+    <a href="ch07.html"><span class="ch">07</span>分布式并行 TP/PP/EP</a>
+    <a href="ch08.html"><span class="ch">08</span>高级特性</a>
+    <a href="ch09.html"><span class="ch">09</span>服务化部署与性能调优</a>
+    <div class="nav-part">第四部分 · 定制</div>
+    <a href="ch10.html"><span class="ch">10</span>接入自己的模型</a>
+    <a href="ch11.html"><span class="ch">11</span>DeepSeek/GLM/Qwen 接入</a>
+    <a href="ch12.html"><span class="ch">12</span>异构硬件部署</a>
+    <a href="ch13.html"><span class="ch">13</span>插件机制实现细节</a>
+    <div class="nav-part">第五部分 · 内核级</div>
+    <a href="ch14.html"><span class="ch">14</span>硬件与模型适配细节</a>
+    <a href="ch15.html"><span class="ch">15</span>性能优化与 TileLang</a>
+    <a href="ch16.html"><span class="ch">16</span>TileLang 内核开发指南</a>
+    <div class="nav-part">资料</div>
+    <a href="appendix.html"><span class="ch">附</span>速查表与常见问题</a>
+  </nav>
+</aside>
+  <div class="main">
+    <div class="topbar">
+      <button class="menu-btn">☰</button>
+      <div class="crumb"><b>附录</b> · 速查表与常见问题</div>
+      <div class="reading-progress"></div>
+    </div>
+    <article class="content">
+      <header class="chapter-hero">
+        <div class="kicker">APPENDIX</div>
+        <h1>速查表 / 术语表 / 常见问题</h1>
+        <div class="badges"><span class="badge">🔖 vLLM v0.31.0</span><span class="badge">📖 参考资料</span></div>
+        <div class="goal">用法：干活时当字典翻；学习卡壳时查术语；报错时对号入座。</div>
+      </header>
+
+      <h2><span class="sec-no">01</span>命令速查</h2>
+      <div class="code-head"><span>命令速查（bash）</span></div>
+      <pre><code class="language-bash"># ── 安装与验证 ────────────────────────────────
+pip install -U vllm                          # 安装最新版(基线 v0.31.0)
+python -c "import vllm; print(vllm.__version__)"
+python -c "import vllm,os;print(os.path.dirname(vllm.__file__))"   # 源码位置
+
+# ── 启动服务 ─────────────────────────────────
+vllm serve &lt;模型&gt; --max-model-len 2048 --gpu-memory-utilization 0.85
+vllm serve &lt;模型&gt; --tensor-parallel-size 2          # 2卡TP
+vllm serve &lt;模型&gt; --quantization fp8                # 在线量化
+vllm serve &lt;模型&gt; --kv-cache-dtype fp8              # KV量化
+vllm serve &lt;模型&gt; --speculative-config '{"method":"ngram","num_speculative_tokens":5}'
+vllm serve &lt;模型&gt; --enable-lora --lora-modules a=/path/a
+
+# ── 压测 ────────────────────────────────────
+vllm bench serve --backend vllm --model &lt;模型&gt; --num-prompts 200 --request-rate 10
+
+# ── 观测 ────────────────────────────────────
+curl localhost:8000/health                          # 健康检查
+curl localhost:8000/metrics | grep -E "num_requests_(running|waiting)"
+tail -f serve.log | grep -iE "preempt|blocks|Prefix"
+</code></pre>
+
+      <h2><span class="sec-no">02</span>参数速查（最常用 12 个）</h2>
+      <div class="table-wrap"><table>
+        <thead><tr><th>参数</th><th>默认</th><th>一句话说明</th></tr></thead>
+        <tbody>
+          <tr><td><code>--model</code></td><td>必填</td><td>HF 模型名或本地路径</td></tr>
+          <tr><td><code>--max-model-len</code></td><td>模型上限</td><td>单请求最大上下文。<strong>吃 KV 座位的大户，按需设</strong></td></tr>
+          <tr><td><code>--gpu-memory-utilization</code></td><td>0.9</td><td>可用显存比例。独占机器可 0.9+</td></tr>
+          <tr><td><code>--max-num-seqs</code></td><td>1024</td><td>并发请求数上限</td></tr>
+          <tr><td><code>--max-num-batched-tokens</code></td><td>8192</td><td>每步 token 预算（chunked prefill 也用它）</td></tr>
+          <tr><td><code>--tensor-parallel-size</code></td><td>1</td><td>TP 卡数（需整除头数/FFN 维度）</td></tr>
+          <tr><td><code>--pipeline-parallel-size</code></td><td>1</td><td>PP 级数（跨机用）</td></tr>
+          <tr><td><code>--enable-prefix-caching</code></td><td>V1 默认开</td><td>前缀缓存</td></tr>
+          <tr><td><code>--dtype</code></td><td>auto</td><td>half/bfloat16/float16</td></tr>
+          <tr><td><code>--quantization</code></td><td>None</td><td>fp8/awq/gptq/bitsandbytes</td></tr>
+          <tr><td><code>--kv-cache-dtype</code></td><td>auto</td><td>KV 量化（fp8 让座位翻倍）</td></tr>
+          <tr><td><code>--block-size</code></td><td>16</td><td>每块 token 数（一般不动）</td></tr>
+        </tbody>
+      </table></div>
+
+      <h2><span class="sec-no">03</span>术语表</h2>
+      <div class="table-wrap"><table>
+        <thead><tr><th>术语</th><th>一句话解释</th><th>详见</th></tr></thead>
+        <tbody>
+          <tr><td>Token</td><td>模型处理文本的最小单位</td><td>第01章</td></tr>
+          <tr><td>Prefill / Decode</td><td>处理输入 / 逐 token 生成的两个阶段</td><td>第01章</td></tr>
+          <tr><td>KV Cache</td><td>历史 token 的 K/V 中间结果缓存</td><td>第01章</td></tr>
+          <tr><td>GQA</td><td>多个 Q 头共享一组 KV 头（KV 变小的原因）</td><td>第01章</td></tr>
+          <tr><td>PagedAttention</td><td>按块管理的注意力机制</td><td>第04章</td></tr>
+          <tr><td>Block / Block Table</td><td>16 token 的 KV 存储块 / 逻辑→物理映射表</td><td>第04章</td></tr>
+          <tr><td>Prefix Caching</td><td>相同前缀复用已算好的 KV</td><td>第04章</td></tr>
+          <tr><td>CoW</td><td>共享块被写入时复制成私有块</td><td>第04章</td></tr>
+          <tr><td>Continuous Batching</td><td>每步动态进出批的调度方式</td><td>第05章</td></tr>
+          <tr><td>Chunked Prefill</td><td>长 prompt 切片分步 prefill</td><td>第05章</td></tr>
+          <tr><td>Preemption (RECOMPUTE)</td><td>显存不足时逐出请求、重算恢复</td><td>第05章</td></tr>
+          <tr><td>TTFT / TPOT / ITL</td><td>首 token 延迟 / 每 token 耗时 / token 间隔</td><td>第09章</td></tr>
+          <tr><td>CUDA Graph</td><td>预录制 kernel 序列，消除启动开销</td><td>第03/06章</td></tr>
+          <tr><td>TP / PP / EP</td><td>张量/流水线/专家并行</td><td>第07章</td></tr>
+          <tr><td>Speculative Decoding</td><td>小模型草稿+大模型并行验证</td><td>第08章</td></tr>
+          <tr><td>EngineCore / AsyncLLM</td><td>引擎子进程 / API 前端类</td><td>第03/06章</td></tr>
+        </tbody>
+      </table></div>
+
+      <h2><span class="sec-no">04</span>常见报错对照</h2>
+      <div class="table-wrap"><table>
+        <thead><tr><th>报错关键词</th><th>原因 → 解法</th><th>详见</th></tr></thead>
+        <tbody>
+          <tr><td><code>out of memory</code> (启动)</td><td>显存预算超了 → 降 utilization / max-model-len / 量化</td><td>第09章 D</td></tr>
+          <tr><td><code>Found no NVIDIA driver</code></td><td>驱动问题 → 宿主机装驱动, nvidia-smi 验证</td><td>第02章</td></tr>
+          <tr><td><code>...heads is not divisible by tensor parallel size</code></td><td>TP 整除约束 → 换 TP 值</td><td>第07章</td></tr>
+          <tr><td><code>max seq len is larger than the maximum number of tokens...</code></td><td>KV 座位装不下 → 减 max-model-len</td><td>第04章</td></tr>
+          <tr><td><code>Preempted ... RECOMPUTE</code> 刷屏</td><td>抢占风暴 → 降并发/量化 KV</td><td>第05章</td></tr>
+          <tr><td>输出乱码/缺字</td><td>增量反分词拼接问题 → 检查客户端拼 delta 方式</td><td>第06章</td></tr>
+          <tr><td>TTFT 突然变高</td><td>前缀缓存失效(模板改了) / 超长请求插队</td><td>第08/09章</td></tr>
+        </tbody>
+      </table></div>
+
+      <h2><span class="sec-no">05</span>自检清单：学完本课程你应该能——</h2>
+      <details class="quiz">
+        <summary>📋 自检清单（逐项打勾）</summary>
+        <div class="quiz-body">
+          <ul>
+            <li>☐ 手算任意模型的每 token KV 大小与可服务并发数</li>
+            <li>☐ 向别人解释 PagedAttention 为什么免碎片（用页表类比）</li>
+            <li>☐ 解释连续批处理为什么快，并演示 <code>lab/sim_continuous_batching.py</code></li>
+            <li>☐ 说出 schedule() 每步的消费顺序与三个关键机制</li>
+            <li>☐ 跟踪一个 HTTP 请求在两个进程间的完整路径</li>
+            <li>☐ 读懂启动日志的全部关键行（blocks / concurrency / 权重占用）</li>
+            <li>☐ 完成一次压测并找到容量拐点，据此给出调参建议</li>
+            <li>☐ 把一个新模型架构注册进 vLLM 并跑通</li>
+            <li>☐ 独立排错：OOM / 抢占风暴 / 缓存失效</li>
+          </ul>
+        </div>
+      </details>
+
+      <h2><span class="sec-no">06</span>延伸阅读</h2>
+      <ul>
+        <li>论文（本课程的三大理论源头）：
+          <ul>
+            <li><em>Efficient Memory Management for LLM Serving with PagedAttention</em> (SOSP'23) —— PagedAttention</li>
+            <li><em>Orca: A Distributed Serving System for Transformer-Based Generative Models</em> (OSDI'22) —— 连续批处理</li>
+            <li><em>FlashAttention</em> 系列 —— 注意力内核</li>
+          </ul>
+        </li>
+        <li>官方文档：docs.vllm.ai（含各模型支持矩阵与参数手册）</li>
+        <li>源码：github.com/vllm-project/vllm（本教程基线 tag: v0.31.0）</li>
+      </ul>
+      <blockquote><p>课程完。真正的掌握来自反复的"原理→实验→提问→再实验"循环——现在，回去把自检清单没打勾的项变成打勾吧。</p></blockquote>
+
+      <nav class="pager">
+        <a href="ch16.html"><div class="dir">← 上一章</div><div class="title">第 16 章 · TileLang 工业级内核开发完全指南</div></a>
+        <a class="next" href="../index.html" title="课程目录"><div class="dir">下一章 →</div><div class="title">课程目录</div></a>
+      </nav>
+      <footer>vLLM 定制开发教程 · 可视化网页版 ｜ <a href="../index.html">返回目录</a></footer>
+    </article>
+  </div>
+</div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/visuals.js"></script>
+<script src="../assets/js/mathjax-tex-svg.js"></script>
+</body>
+</html>

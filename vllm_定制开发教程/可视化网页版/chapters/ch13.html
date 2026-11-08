@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 13 章 · vLLM 插件机制实现细节 ｜ vLLM 定制开发教程</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+  <a class="brand" href="../index.html">
+    <div class="logo">vLLM 定制开发教程</div>
+    <div class="sub">原理 + 实操，知行合一 · v0.31.0</div>
+  </a>
+  <nav>
+    <a href="../index.html"><span class="ch">🏠</span>课程首页</a>
+    <div class="nav-part">第一部分 · 打地基</div>
+    <a href="ch01.html"><span class="ch">01</span>大模型推理基础</a>
+    <a href="ch02.html"><span class="ch">02</span>环境安装与第一次推理</a>
+    <div class="nav-part">第二部分 · 核心原理</div>
+    <a href="ch03.html"><span class="ch">03</span>整体架构鸟瞰</a>
+    <a href="ch04.html"><span class="ch">04</span>PagedAttention 与 KV Cache</a>
+    <a href="ch05.html"><span class="ch">05</span>调度器与连续批处理</a>
+    <a href="ch06.html"><span class="ch">06</span>一次请求的完整旅程</a>
+    <div class="nav-part">第三部分 · 进阶</div>
+    <a href="ch07.html"><span class="ch">07</span>分布式并行 TP/PP/EP</a>
+    <a href="ch08.html"><span class="ch">08</span>高级特性</a>
+    <a href="ch09.html"><span class="ch">09</span>服务化部署与性能调优</a>
+    <div class="nav-part">第四部分 · 定制</div>
+    <a href="ch10.html"><span class="ch">10</span>接入自己的模型</a>
+    <a href="ch11.html"><span class="ch">11</span>DeepSeek/GLM/Qwen 接入</a>
+    <a href="ch12.html"><span class="ch">12</span>异构硬件部署</a>
+    <a href="ch13.html"><span class="ch">13</span>插件机制实现细节</a>
+    <div class="nav-part">第五部分 · 内核级</div>
+    <a href="ch14.html"><span class="ch">14</span>硬件与模型适配细节</a>
+    <a href="ch15.html"><span class="ch">15</span>性能优化与 TileLang</a>
+    <a href="ch16.html"><span class="ch">16</span>TileLang 内核开发指南</a>
+    <div class="nav-part">资料</div>
+    <a href="appendix.html"><span class="ch">附</span>速查表与常见问题</a>
+  </nav>
+</aside>
+  <div class="main">
+    <div class="topbar">
+      <button class="menu-btn">☰</button>
+      <div class="crumb"><b>第 13 章</b> · 插件机制实现细节</div>
+      <div class="reading-progress"></div>
+    </div>
+    <article class="content">
+      <header class="chapter-hero">
+        <div class="kicker">CHAPTER 13</div>
+        <h1>vLLM 插件机制实现细节（附完整可运行示例）</h1>
+        <div class="badges"><span class="badge">🔖 vLLM v0.31.0</span><span class="badge lab">🔧 动手实验</span></div>
+        <div class="goal">本章目标：把 vLLM 的插件系统拆到"能自己写一个"的程度。本章所有接口描述均摘自 vLLM v0.31.0 源码 vllm/plugins/ 目录（一手资料），配套完整示例包：lab/my_vllm_plugin/（已通过语法与配置验证，装上就能跑）。</div>
+      </header>
+
+<h2><span class="sec-no">13.0</span>全景：vLLM 有一张"插件入口点注册表"</h2>
+<p>vLLM 用 Python 标准的 <strong>entry points 机制</strong>（<code>importlib.metadata.entry_points</code>）发现插件。源码 <code>vllm/plugins/__init__.py</code> 定义了 <strong>5 个入口点组</strong>，各有明确的加载进程与时机：</p>
+<div class="table-wrap"><table>
+<thead><tr><th>入口点组</th><th>加载的进程</th><th>时机</th><th>用途</th></tr></thead>
+<tbody>
+<tr><td><code>vllm.general_plugins</code></td><td><strong>所有进程</strong>（process0 / EngineCore / 每个 Worker）</td><td>进程初始化</td><td>注册模型/平台/RPC/全局副作用</td></tr>
+<tr><td><code>vllm.platform_plugins</code></td><td>所有进程</td><td><strong><code>current_platform</code> 初始化时</strong>（且尚未初始化）</td><td>提供自定义硬件平台（昇腾插件走这里）</td></tr>
+<tr><td><code>vllm.io_processor_plugins</code></td><td>仅 process0（API 前端）</td><td>引擎构建</td><td>引擎输入/输出的前后处理</td></tr>
+<tr><td><code>vllm.endpoint_plugins</code></td><td>仅 API 前端进程</td><td><code>build_app()</code></td><td>给 FastAPI 加自定义 HTTP 路由</td></tr>
+<tr><td><code>vllm.stat_logger_plugins</code></td><td>仅 process0</td><td>async serve 模式</td><td>统计/日志上报</td></tr>
+</tbody>
+</table></div>
+<p><strong>加载的通用逻辑</strong>（<code>load_plugins_by_group()</code>）：</p>
+<div class="code-head"><span>vllm/plugins/__init__.py</span></div>
+<pre><code class="language-python">discovered = entry_points(group=group)          # 1. 扫描已安装包的 entry points
+for plugin in discovered:
+    if allowed is None or plugin.name in allowed:   # 2. VLLM_PLUGINS 白名单过滤
+        try:
+            func = plugin.load()                # 3. 导入并加载
+        except Exception:
+            logger.exception(...)               # 4. 失败只记日志, 不炸引擎(容错!)</code></pre>
+<p>三个工程细节（源码注释原话的提炼）：</p>
+<ol>
+<li><strong>白名单</strong>：环境变量 <code>VLLM_PLUGINS</code> 控制加载哪些插件（逗号分隔名字）；未设置 = 该组全部加载。⚠️ 特例：<code>VLLM_PLUGINS=""</code> 会解析成 <code>[""]</code>——一个谁都匹配不上的允许列表，等于"全禁"，<strong>不是</strong>"未设置"；</li>
+<li><strong>幂等要求</strong>：插件会在多个进程重复加载，必须设计成"加载多次不出事"（源码原话 WARNING：<em>plugins can be loaded for multiple times in different processes</em>）；</li>
+<li><strong>失败容忍</strong>：单个插件加载失败只打日志，不影响 vLLM 启动——所以插件坏了要去日志里翻 <code>Failed to load plugin ...</code>。</li>
+</ol>
+<div class="viz" data-viz="journey-flow">
+  <div class="viz-head"><span class="dot"></span><span class="title">插件包从安装到被 vLLM 加载生效的时序</span><span class="desc">5 个入口点组各自的加载进程与时机 · 对应 13.0 节</span></div>
+  <div class="viz-body"></div>
+  <script type="application/json" class="viz-cfg">{"steps":[
+    {"title":"编写插件包","detail":"按职责分文件组织：<code>general.py</code>（注册副作用）、<code>io_processor.py</code>（引擎进/出水口滤网）、<code>endpoint.py</code>（HTTP 自定义路由），外加 <code>pyproject.toml</code>。"},
+    {"title":"pyproject.toml 注册入口点","detail":"把\"入口名 = 包名:函数\"写进 vLLM 的入口点组——这是 vLLM 发现插件的唯一依据（源码 vllm/plugins/__init__.py）。","code":"[project.entry-points.\"vllm.general_plugins\"]\nmy_banner = \"my_vllm_plugin.general:register_banner\"\n\n[project.entry-points.\"vllm.endpoint_plugins\"]\nmy_healthcheck = \"my_vllm_plugin.endpoint:create_endpoint_plugin\""},
+    {"title":"pip install -e . 安装","detail":"entry points 进入系统注册表；不启动 vLLM 也能用 importlib.metadata 直接查注册表验证。","code":"pip install -e ."},
+    {"title":"current_platform 初始化 → platform_plugins","detail":"current_platform 单例首次初始化且尚未就绪时加载该组，插件返回的平台类取代内置检测结果（昇腾插件走这里）。"},
+    {"title":"各进程加载 general_plugins","detail":"process0 / EngineCore / 每个 Worker 进程初始化时都会直接调用你的零参函数——必须幂等，加载多次不出事。"},
+    {"title":"VLLM_PLUGINS 白名单过滤","detail":"逗号分隔名字；未设置 = 该组全部加载；VLLM_PLUGINS=\"\" 会解析成 [\"\"]——谁都匹配不上，等于\"全禁\"。","code":"export VLLM_PLUGINS=my_banner,my_healthcheck"},
+    {"title":"引擎构建 → io_processor_plugins","detail":"仅 process0（API 前端）在引擎构建时加载：pre_process 进引擎前、post_process 出引擎后。"},
+    {"title":"build_app() → endpoint_plugins 两阶段接线","detail":"attach_router 注册路由（最后挂载，可遮蔽同名核心路由）→ init_state 注入 engine_client。安全设计：VLLM_PLUGINS 未设置时一个都不加载。"},
+    {"title":"async serve → stat_logger_plugins","detail":"仅 process0 在 async serve 模式加载，统计/日志上报生效。"},
+    {"title":"失败容错与调试","detail":"单个插件加载失败只记日志不炸引擎——插件坏了去日志里翻 Failed to load plugin；三板斧定位。","code":"export VLLM_LOGGING_LEVEL=DEBUG\ntail -f serve.log | grep -i plugin"}
+  ]}</script>
+</div>
+
+<h2><span class="sec-no">13.1</span>general_plugins：最常用的注册通道</h2>
+<p>entry point 指向一个<strong>零参函数</strong>，vLLM 在每个进程里<strong>直接调用它</strong>。你的函数体里想干什么都行——这是"注册副作用"的通道：</p>
+<div class="code-head"><span>my_vllm_plugin/general.py</span></div>
+<pre><code class="language-python">def register_banner():
+    # 用途① 注册自定义模型架构(第10章 L3 的正规军方式, 优于改 registry.py 源文件)
+    # 用途② 注册自定义平台
+    # 用途③ 注册 worker 侧 RPC 方法(collective_rpc), 与 endpoint 插件配对(见13.3)
+    # 用途④ 环境/配置预处理
+    ...</code></pre>
+<p>完整可运行示例：<a href="../../lab/my_vllm_plugin/my_vllm_plugin/general.py"><code>lab/my_vllm_plugin/my_vllm_plugin/general.py</code></a>。</p>
+
+<h2><span class="sec-no">13.2</span>IOProcessor：给引擎装"进水口/出水口滤网"</h2>
+<p>接口（<code>vllm/plugins/io_processors/interface.py</code>，泛型抽象类）：</p>
+<div class="code-head"><span>vllm/plugins/io_processors/interface.py</span></div>
+<pre><code class="language-python">class IOProcessor(ABC, Generic[In, Out]):
+    def __init__(self, vllm_config, renderer): ...   # vLLM 注入配置与渲染器
+    def parse_data(self, data) -> In: ...            # 解析请求里的自定义 data 字段
+    def merge_sampling_params(self, params): ...     # 钩子: 强制修改采样参数
+    @abstractmethod
+    def pre_process(self, prompt, request_id) -> PromptType   # ★ 进引擎前
+    @abstractmethod
+    def post_process(self, outputs, request_id) -> Out        # ★ 出引擎后
+    # 每个方法都有 _async 版本, 默认委托同步版; async 版的 post_process
+    # 会先把乱序到达的输出按 id 排序再交给你(源码注释: 顺序不保证!)</code></pre>
+<p><strong>适用场景</strong>：敏感词过滤、私有协议适配（公司内部网关格式 ↔ vLLM 内部格式）、请求审计、输出脱敏。示例实现见 <a href="../../lab/my_vllm_plugin/my_vllm_plugin/io_processor.py"><code>my_vllm_plugin/io_processor.py</code></a>（实现了敏感词替换）。</p>
+
+<h2><span class="sec-no">13.3</span>EndpointPlugin：给 API 服务加自定义路由</h2>
+<p>这是安全设计最讲究的一组（接口 <code>endpoint_plugins/interface.py</code>，Protocol 定义）：</p>
+<div class="code-head"><span>vllm/plugins/endpoint_plugins/interface.py</span></div>
+<pre><code class="language-python">class EndpointPlugin(Protocol):
+    name: str                                  # VLLM_PLUGINS 白名单里的名字
+    required_tasks: tuple[SupportedTask, ...] | None   # 服务须支持这些任务才加载; None=不限
+    def attach_router(self, app: FastAPI) -> None       # Phase A: 注册路由
+    async def init_state(self, engine_client, state, args)  # Phase B: 引擎句柄注入</code></pre>
+<p><strong>三个必须理解的设计决策：</strong></p>
+<ol>
+<li><strong>默认不加载</strong>：其他组是"白名单外全加载"，本组反过来——<code>VLLM_PLUGINS</code> <strong>未设置时一个都不加载</strong>（因为插件扩大 HTTP 攻击面）。未加载却发现了插件时，日志会警告 <code>Found endpoint plugin(s) ... but VLLM_PLUGINS is not set</code>；</li>
+<li><strong>两阶段接线</strong>：<code>attach_router</code>（build_app 阶段，最后挂载，<strong>可遮蔽同名核心路由</strong>）→ <code>init_state</code>（init_app_state 阶段，此时 <code>engine_client</code> 就绪）。还有个细节：纯 CPU 渲染服务器没有引擎，<code>engine_client=None</code>，插件须自行容错；</li>
+<li><strong>只做 HTTP 面</strong>：插件不许自开引擎访问通道；要动引擎就与 general_plugins 配对——<strong>general_plugins 安装引擎侧方法，endpoint_plugins 把它暴露成 HTTP</strong>（两份注册互相独立，谁也不 implies 谁——源码文档原话）。</li>
+</ol>
+<p>完整可运行示例：<a href="../../lab/my_vllm_plugin/my_vllm_plugin/endpoint.py"><code>lab/my_vllm_plugin/endpoint.py</code></a>（<code>/plugin/ping</code> 端点，演示两阶段状态）。</p>
+
+<h2><span class="sec-no">13.4</span>platform_plugins：硬件插件的接入口</h2>
+<p><code>current_platform</code> 单例<strong>首次初始化且尚未就绪时</strong>，vLLM 会加载该组，插件返回的平台类将<strong>取代内置检测结果</strong>（vllm-ascend 的接法，第 12 章 12.1 已图解）。写硬件插件 = 实现 <code>vllm/platforms/interface.py</code> 中 <code>Platform</code> 抽象类的全部抽象方法（设备类型、显存查询、graph 支持、内核选择策略……第 12 章实验 12-3 让你数过一遍）。</p>
+
+<h2><span class="sec-no">13.5</span>亲手做一个插件：完整五步（示例包已就绪）</h2>
+<div class="code-head"><span>bash</span></div>
+<pre><code class="language-bash">cd lab/my_vllm_plugin
+pip install -e .          # ① 安装: entry points 进入系统注册表
+                          # ② general: 无需任何环境变量, 启动即加载
+
+# ③ endpoint: 必须显式列入白名单(13.3 的安全设计)
+export VLLM_PLUGINS=my_healthcheck
+vllm serve Qwen/Qwen2.5-0.5B-Instruct --max-model-len 512 &amp;
+
+# ④ 验证 HTTP 端点
+curl http://localhost:8000/plugin/ping
+# → {"ping":"pong","plugin":"my_healthcheck","engine_ready":true}
+
+# ⑤ 验证 general 插件在多进程加载: 启动日志里搜
+grep -c "my_vllm_plugin" serve.log    # &gt;1 证明它在多个进程各加载了一次</code></pre>
+<p><strong>调试插件的三板斧</strong>：</p>
+<div class="code-head"><span>bash</span></div>
+<pre><code class="language-bash">export VLLM_LOGGING_LEVEL=DEBUG       # 看 "Available plugins for group ..." 列表
+tail -f serve.log | grep -i plugin    # 加载/失败/跳过 全在这里
+python3 -c "from importlib.metadata import entry_points; \
+    print([ (e.name,e.value) for g in ['vllm.general_plugins','vllm.endpoint_plugins'] for e in entry_points(group=g)])"
+                                      # 不启动 vLLM, 直接查注册表</code></pre>
+
+<h2><span class="sec-no">13.6</span>插件 vs 改源码：决策指南</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>需求</th><th>正确姿势</th></tr></thead>
+<tbody>
+<tr><td>加 HTTP 端点/审计/过滤</td><td>endpoint / io_processor 插件</td></tr>
+<tr><td>注册新模型、新平台</td><td>general / platform 插件</td></tr>
+<tr><td>改调度策略、KV 管理行为</td><td>只能改源码（fork + 可编辑安装），目前无插件通道</td></tr>
+<tr><td>临时观察内部（不发布）</td><td>monkeypatch（第 06 章 instrument.py）</td></tr>
+</tbody>
+</table></div>
+<blockquote>优先插件的原因：上游升级零冲突。改源码的部分越少，跟着 vLLM 半月一个版本的节奏走越轻松。</blockquote>
+
+<h2><span class="sec-no">13.7</span>动手实验</h2>
+<p>✅ <strong>实验 13-1（必做）</strong>：按 13.5 的五步，把示例插件跑通，截图三处证据：<code>/plugin/ping</code> 返回 JSON、启动日志的 general 插件加载行、<code>VLLM_PLUGINS</code> 去掉后 endpoint 插件的警告行。</p>
+<p>✅ <strong>实验 13-2（推荐）</strong>：给 <a href="../../lab/my_vllm_plugin/my_vllm_plugin/io_processor.py"><code>io_processor.py</code></a> 的 <code>BANNED_WORDS</code> 加两个词，重启后验证过滤生效（请求前用 curl 发含敏感词的 prompt）。</p>
+<p>🔬 <strong>实验 13-3（硬核）</strong>：把 13.1 注释里的"注册自定义模型"代码解开，配合第 10 章实验 10-1 的克隆模型，走一遍<strong>不改 vLLM 源码文件</strong>的模型注册——这才是生产级定制模型的正确发布方式。</p>
+
+<h2><span class="sec-no">13.8</span>本章小结 + 自测</h2>
+<details class="quiz">
+<summary>📋 本章自测</summary>
+<div class="quiz-body">
+<ol>
+<li>默写 5 个入口点组及各自"在哪个进程、什么时候"加载。</li>
+<li><code>VLLM_PLUGINS=""</code> 和不设置它，行为差异是什么？endpoint 插件的默认姿态为什么和其他组相反？</li>
+<li>IOProcessor 的两个抽象方法？它的 async post_process 为什么要先排序？</li>
+<li>EndpointPlugin 的两阶段接线各发生在什么时机？<code>engine_client</code> 什么时候是 None？</li>
+<li>general_plugins 与 endpoint_plugins 如何配对实现"引擎侧能力 + HTTP 暴露"？</li>
+</ol>
+</div>
+</details>
+
+      <nav class="pager">
+        <a href="ch12.html"><div class="dir">← 上一章</div><div class="title">异构硬件部署指南</div></a>
+        <a class="next" href="appendix.html"><div class="dir">下一章 →</div><div class="title">附录 · 速查表与常见问题</div></a>
+      </nav>
+      <footer>vLLM 定制开发教程 · 可视化网页版 ｜ <a href="../index.html">返回目录</a></footer>
+    </article>
+  </div>
+</div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/visuals.js"></script>
+<script src="../assets/js/mathjax-tex-svg.js"></script>
+</body>
+</html>

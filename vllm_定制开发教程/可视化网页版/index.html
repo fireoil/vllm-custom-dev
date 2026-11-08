@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vLLM 定制开发教程 · 可视化网页版</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <a class="brand" href="index.html">
+      <div class="logo">vLLM 定制开发教程</div>
+      <div class="sub">原理 + 实操，知行合一 · v0.31.0</div>
+    </a>
+    <nav>
+      <a href="index.html"><span class="ch">🏠</span>课程首页</a>
+      <div class="nav-part">第一部分 · 打地基</div>
+      <a href="chapters/ch01.html"><span class="ch">01</span>大模型推理基础</a>
+      <a href="chapters/ch02.html"><span class="ch">02</span>环境安装与第一次推理</a>
+      <div class="nav-part">第二部分 · 核心原理</div>
+      <a href="chapters/ch03.html"><span class="ch">03</span>整体架构鸟瞰</a>
+      <a href="chapters/ch04.html"><span class="ch">04</span>PagedAttention 与 KV Cache</a>
+      <a href="chapters/ch05.html"><span class="ch">05</span>调度器与连续批处理</a>
+      <a href="chapters/ch06.html"><span class="ch">06</span>一次请求的完整旅程</a>
+      <div class="nav-part">第三部分 · 进阶</div>
+      <a href="chapters/ch07.html"><span class="ch">07</span>分布式并行 TP/PP/EP</a>
+      <a href="chapters/ch08.html"><span class="ch">08</span>高级特性</a>
+      <a href="chapters/ch09.html"><span class="ch">09</span>服务化部署与性能调优</a>
+      <div class="nav-part">第四部分 · 定制</div>
+      <a href="chapters/ch10.html"><span class="ch">10</span>接入自己的模型</a>
+      <a href="chapters/ch11.html"><span class="ch">11</span>DeepSeek/GLM/Qwen 接入</a>
+      <a href="chapters/ch12.html"><span class="ch">12</span>异构硬件部署</a>
+      <a href="chapters/ch13.html"><span class="ch">13</span>插件机制实现细节</a>
+      <div class="nav-part">第五部分 · 内核级</div>
+      <a href="chapters/ch14.html"><span class="ch">14</span>硬件与模型适配细节</a>
+      <a href="chapters/ch15.html"><span class="ch">15</span>性能优化与 TileLang</a>
+      <a href="chapters/ch16.html"><span class="ch">16</span>TileLang 内核开发指南</a>
+      <div class="nav-part">资料</div>
+      <a href="chapters/appendix.html"><span class="ch">附</span>速查表与常见问题</a>
+    </nav>
+  </aside>
+  <div class="main">
+    <section class="hero-home">
+      <h1>vLLM <span class="grad">定制开发教程</span></h1>
+      <p class="tagline">原理 + 实操，知行合一 —— 从「为什么需要 vLLM」到「接入自己的模型 / 写内核」。<br>
+      本网页版在原文档基础上增加了 <b style="color:var(--accent)">交互式可视化</b>：亲手拨动显存块、跑一遍调度器，让抽象机制看得见。</p>
+      <div class="hero-meta">
+        <div class="m">📚 <b>16 章</b> + 附录</div>
+        <div class="m">🕹 <b>10+</b> 交互可视化</div>
+        <div class="m">🔖 基于 <b>vLLM v0.31.0</b></div>
+        <div class="m">🖥 <b>8GB</b> 消费级显卡可跑全部实验</div>
+      </div>
+    </section>
+
+    <article class="content" style="padding-top:10px;">
+
+      <div class="part-section"><span class="pno">开胃菜</span><h2>先玩一把：KV Cache 有多大？</h2><div class="line"></div></div>
+      <div class="viz" data-viz="kv-calc">
+        <div class="viz-head"><span class="dot"></span><span class="title">KV Cache 大小计算器</span><span class="desc">拖动滑块，直观感受显存去哪了（第 01/04 章内容预览）</span></div>
+        <div class="viz-body"></div>
+      </div>
+
+      <div class="part-section"><span class="pno">PART 1</span><h2>打地基 · 为什么</h2><div class="line"></div></div>
+      <div class="card-grid">
+        <a class="card" href="chapters/ch01.html">
+          <div class="no">CHAPTER 01</div>
+          <div class="t">大模型推理基础：一次推理到底发生了什么</div>
+          <div class="d">自回归、Prefill/Decode 两阶段、KV Cache 空间账本、传统引擎的三种浪费。</div>
+          <div class="tags"><span class="tag viz">条形图对比</span><span class="tag viz">浪费可视化</span><span class="tag viz">KV 计算器</span></div>
+        </a>
+        <a class="card" href="chapters/ch02.html">
+          <div class="no">CHAPTER 02 【动手】</div>
+          <div class="t">环境安装与第一次推理</div>
+          <div class="d">安装 vLLM、离线 LLM API 跑通第一段生成、认识输出里的 finish_reason。</div>
+          <div class="tags"><span class="tag lab">🔧 first_run.py</span></div>
+        </a>
+      </div>
+
+      <div class="part-section"><span class="pno">PART 2</span><h2>核心原理 · 是什么</h2><div class="line"></div></div>
+      <div class="card-grid">
+        <a class="card" href="chapters/ch03.html">
+          <div class="no">CHAPTER 03 【动手】</div>
+          <div class="t">vLLM 整体架构鸟瞰</div>
+          <div class="d">API 服务层 / EngineCore / 调度器 / ModelRunner 分层拆解，看懂启动日志。</div>
+          <div class="tags"><span class="tag viz">架构分层图</span><span class="tag lab">🔧 日志走读</span></div>
+        </a>
+        <a class="card" href="chapters/ch04.html">
+          <div class="no">CHAPTER 04 【动手】</div>
+          <div class="t">PagedAttention 与 KV Cache</div>
+          <div class="d">操作系统分页思想如何榨干显存：块表、前缀共享、引用计数、抢占换出。</div>
+          <div class="tags"><span class="tag viz">🕹 显存块模拟器</span><span class="tag lab">🔧 sim_paged_kv.py</span></div>
+        </a>
+        <a class="card" href="chapters/ch05.html">
+          <div class="no">CHAPTER 05 【动手】</div>
+          <div class="t">调度器与连续批处理</div>
+          <div class="d">vLLM 调度器每一步在干什么：静态 vs 连续批处理动画对比、抢占与分块预填充。</div>
+          <div class="tags"><span class="tag viz">🕹 调度对比动画</span><span class="tag lab">🔧 sim_continuous_batching.py</span></div>
+        </a>
+        <a class="card" href="chapters/ch06.html">
+          <div class="no">CHAPTER 06 【动手】</div>
+          <div class="t">一次请求的完整旅程（源码走读）</div>
+          <div class="d">从 HTTP 请求到第一个 token：AsyncLLM → 调度 → ModelRunner → 采样 → 流式返回。</div>
+          <div class="tags"><span class="tag viz">请求旅程步进图</span><span class="tag lab">🔬 instrument.py</span></div>
+        </a>
+      </div>
+
+      <div class="part-section"><span class="pno">PART 3</span><h2>进阶 · 怎么快</h2><div class="line"></div></div>
+      <div class="card-grid">
+        <a class="card" href="chapters/ch07.html">
+          <div class="no">CHAPTER 07</div>
+          <div class="t">分布式并行：TP / PP / EP</div>
+          <div class="d">三种切法各切的是什么、通信发生在哪、气泡从哪来、参数怎么选。</div>
+          <div class="tags"><span class="tag viz">并行策略切换图</span></div>
+        </a>
+        <a class="card" href="chapters/ch08.html">
+          <div class="no">CHAPTER 08</div>
+          <div class="t">高级特性：投机解码 / 量化 / 结构化输出</div>
+          <div class="d">Chunked Prefill、投机解码的草稿-验证博弈、KV offload 等新特性。</div>
+          <div class="tags"><span class="tag viz">投机解码动画</span></div>
+        </a>
+        <a class="card" href="chapters/ch09.html">
+          <div class="no">CHAPTER 09 【动手】</div>
+          <div class="t">服务化部署与性能调优</div>
+          <div class="d">OpenAI Server 全参数实战、压测方法论、GPU 利用率与 TTFT/TPOT 权衡。</div>
+          <div class="tags"><span class="tag lab">🚀 real_vllm_bench.py</span></div>
+        </a>
+      </div>
+
+      <div class="part-section"><span class="pno">PART 4</span><h2>定制 · 怎么改</h2><div class="line"></div></div>
+      <div class="card-grid">
+        <a class="card" href="chapters/ch10.html">
+          <div class="no">CHAPTER 10 【动手】</div>
+          <div class="t">定制开发：接入自己的模型</div>
+          <div class="d">注册新模型架构全流程：config → modeling → Registry → 权重加载。</div>
+          <div class="tags"><span class="tag viz">接入流程图</span></div>
+        </a>
+        <a class="card" href="chapters/ch11.html">
+          <div class="no">CHAPTER 11</div>
+          <div class="t">主流模型接入：DeepSeek / GLM / Qwen</div>
+          <div class="d">MLA、MoE、MTP 三大特色机制在 vLLM 中的实现细节。</div>
+          <div class="tags"><span class="tag">MLA</span><span class="tag">MoE</span><span class="tag">MTP</span></div>
+        </a>
+        <a class="card" href="chapters/ch12.html">
+          <div class="no">CHAPTER 12</div>
+          <div class="t">异构硬件部署：NVIDIA / AMD / Intel / CPU / 昇腾</div>
+          <div class="d">Platform 平台抽象、硬件插件、各平台部署命令与坑。</div>
+          <div class="tags"><span class="tag viz">平台适配链路图</span></div>
+        </a>
+        <a class="card" href="chapters/ch13.html">
+          <div class="no">CHAPTER 13 【动手】</div>
+          <div class="t">vLLM 插件机制实现细节</div>
+          <div class="d">entry-points 三类注册、加载时序，亲手写一个完整插件包。</div>
+          <div class="tags"><span class="tag lab">🔬 my_vllm_plugin/</span></div>
+        </a>
+      </div>
+
+      <div class="part-section"><span class="pno">PART 5</span><h2>内核级 · 怎么更快（进阶篇）</h2><div class="line"></div></div>
+      <div class="card-grid">
+        <a class="card" href="chapters/ch14.html">
+          <div class="no">CHAPTER 14</div>
+          <div class="t">硬件与模型适配的代码级细节</div>
+          <div class="d">Platform 问卷、内核选择链路（backend → dispatch → kernel）逐层拆解。</div>
+          <div class="tags"><span class="tag">源码级</span></div>
+        </a>
+        <a class="card" href="chapters/ch15.html">
+          <div class="no">CHAPTER 15 【动手】</div>
+          <div class="t">性能优化方法论 + TileLang 算子实战</div>
+          <div class="d">Roofline 定位瓶颈，GEMM / RMSNorm / FlashAttention 三个算子渐进实战。</div>
+          <div class="tags"><span class="tag lab">🔬 tilelang/</span></div>
+        </a>
+        <a class="card" href="chapters/ch16.html">
+          <div class="no">CHAPTER 16 【动手】</div>
+          <div class="t">TileLang 工业级内核开发完全指南</div>
+          <div class="d">MLA / GQA / MoE / W4A16 内核实现 + 多硬件（NPU）适配，生产级完整指南。</div>
+          <div class="tags"><span class="tag">MLA</span><span class="tag">MoE</span><span class="tag">NPU</span></div>
+        </a>
+      </div>
+
+      <div class="part-section"><span class="pno">资料</span><h2>附录</h2><div class="line"></div></div>
+      <div class="card-grid">
+        <a class="card" href="chapters/appendix.html">
+          <div class="no">APPENDIX</div>
+          <div class="t">速查表 / 常见报错 / 术语表</div>
+          <div class="d">参数速查、报错对照、术语索引 —— 随用随查。</div>
+          <div class="tags"><span class="tag">参考</span></div>
+        </a>
+      </div>
+
+      <div class="part-section"><span class="pno">说明</span><h2>配套实验代码</h2><div class="line"></div></div>
+      <div class="viz">
+        <div class="viz-head"><span class="dot"></span><span class="title">lab/ 目录导览</span><span class="desc">三档实验：🔧 零门槛模拟器 · 🚀 真机实验 · 🔬 源码插桩</span></div>
+        <div class="viz-body">
+          <div class="toc-list">
+            <a href="../lab/sim_paged_kv.py"><span class="n">🔧</span>sim_paged_kv.py — PagedAttention 块管理模拟（无 GPU）</a>
+            <a href="../lab/sim_continuous_batching.py"><span class="n">🔧</span>sim_continuous_batching.py — 静态 vs 连续批处理模拟</a>
+            <a href="../lab/first_run.py"><span class="n">🚀</span>first_run.py — 第一个 vLLM 程序</a>
+            <a href="../lab/real_vllm_prefix_cache.py"><span class="n">🚀</span>real_vllm_prefix_cache.py — 前缀缓存真机验证</a>
+            <a href="../lab/real_vllm_bench.py"><span class="n">🚀</span>real_vllm_bench.py — 真机压测调度参数</a>
+            <a href="../lab/instrument.py"><span class="n">🔬</span>instrument.py — 引擎主循环插桩</a>
+            <a href="../lab/my_vllm_plugin/"><span class="n">🔬</span>my_vllm_plugin/ — 完整可运行插件包</a>
+            <a href="../lab/tilelang/"><span class="n">🔬</span>tilelang/ — TileLang 算子渐进实验</a>
+          </div>
+        </div>
+      </div>
+
+      <footer>vLLM 定制开发教程 · 可视化网页版 ｜ 课程版本基线 vLLM v0.31.0 ｜ 所有页面离线可用</footer>
+    </article>
+  </div>
+</div>
+<script src="assets/js/main.js"></script>
+<script src="assets/js/visuals.js"></script>
+<script src="assets/js/mathjax-tex-svg.js"></script>
+</body>
+</html>

@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 10 章 · 定制开发：接入自己的模型 ｜ vLLM 定制开发教程</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+  <a class="brand" href="../index.html">
+    <div class="logo">vLLM 定制开发教程</div>
+    <div class="sub">原理 + 实操，知行合一 · v0.31.0</div>
+  </a>
+  <nav>
+    <a href="../index.html"><span class="ch">🏠</span>课程首页</a>
+    <div class="nav-part">第一部分 · 打地基</div>
+    <a href="ch01.html"><span class="ch">01</span>大模型推理基础</a>
+    <a href="ch02.html"><span class="ch">02</span>环境安装与第一次推理</a>
+    <div class="nav-part">第二部分 · 核心原理</div>
+    <a href="ch03.html"><span class="ch">03</span>整体架构鸟瞰</a>
+    <a href="ch04.html"><span class="ch">04</span>PagedAttention 与 KV Cache</a>
+    <a href="ch05.html"><span class="ch">05</span>调度器与连续批处理</a>
+    <a href="ch06.html"><span class="ch">06</span>一次请求的完整旅程</a>
+    <div class="nav-part">第三部分 · 进阶</div>
+    <a href="ch07.html"><span class="ch">07</span>分布式并行 TP/PP/EP</a>
+    <a href="ch08.html"><span class="ch">08</span>高级特性</a>
+    <a href="ch09.html"><span class="ch">09</span>服务化部署与性能调优</a>
+    <div class="nav-part">第四部分 · 定制</div>
+    <a href="ch10.html"><span class="ch">10</span>接入自己的模型</a>
+    <a href="ch11.html"><span class="ch">11</span>DeepSeek/GLM/Qwen 接入</a>
+    <a href="ch12.html"><span class="ch">12</span>异构硬件部署</a>
+    <a href="ch13.html"><span class="ch">13</span>插件机制实现细节</a>
+    <div class="nav-part">第五部分 · 内核级</div>
+    <a href="ch14.html"><span class="ch">14</span>硬件与模型适配细节</a>
+    <a href="ch15.html"><span class="ch">15</span>性能优化与 TileLang</a>
+    <a href="ch16.html"><span class="ch">16</span>TileLang 内核开发指南</a>
+    <div class="nav-part">资料</div>
+    <a href="appendix.html"><span class="ch">附</span>速查表与常见问题</a>
+  </nav>
+</aside>
+  <div class="main">
+    <div class="topbar">
+      <button class="menu-btn">☰</button>
+      <div class="crumb"><b>第 10 章</b> · 接入自己的模型</div>
+      <div class="reading-progress"></div>
+    </div>
+    <article class="content">
+      <header class="chapter-hero">
+        <div class="kicker">CHAPTER 10</div>
+        <h1>定制开发：接入自己的模型 / 修改 vLLM 行为</h1>
+        <div class="badges"><span class="badge">🔖 vLLM v0.31.0</span><span class="badge lab">🔧 动手实验</span></div>
+        <div class="goal">本章目标：走出"使用"，进入"改造"。覆盖四个层级的定制，由浅入深：①换 tokenizer/模板 ②加参数改行为 ③注册自己的模型架构 ④写自己的注意力后端。这是本课程的毕业章——学完你就是"vLLM 二次开发工程师"。</div>
+      </header>
+
+<h2><span class="sec-no">10.0</span>定制层级地图</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>层级</th><th>场景</th><th>难度</th><th>本章小节</th></tr></thead>
+<tbody>
+<tr><td>L1 配置级</td><td>换聊天模板、改采样默认值</td><td>⭐</td><td>10.1</td></tr>
+<tr><td>L2 插桩级</td><td>观察内部、拦截请求/输出</td><td>⭐⭐</td><td>10.2</td></tr>
+<tr><td>L3 模型级</td><td>支持一个新模型架构</td><td>⭐⭐⭐⭐</td><td>10.3</td></tr>
+<tr><td>L4 内核级</td><td>自定义注意力后端/算子</td><td>⭐⭐⭐⭐⭐</td><td>10.4</td></tr>
+</tbody>
+</table></div>
+<p><strong>总原则：能用 L1 不用 L2，能用 L2 不用 L3。</strong>（改得越深，跟上游版本同步的成本越高。）</p>
+
+<h2><span class="sec-no">10.1</span>L1 配置级定制</h2>
+<h3>换聊天模板（最高频需求）</h3>
+<p>vLLM 默认用 HuggingFace 模型仓库里的 <code>tokenizer_config.json</code> 里的 chat template。自建模型/特殊格式时，用 <code>--chat-template</code> 指定自己的 jinja2 模板：</p>
+<div class="code-head"><span>bash</span></div>
+<pre><code class="language-bash">vllm serve my-model --chat-template /path/my_template.jinja</code></pre>
+<div class="code-head"><span>my_template.jinja</span></div>
+<pre><code class="language-jinja">{# my_template.jinja 最小示例 #}
+{%- for m in messages %}{%- if m.role == 'user' %}[用户]: {{ m.content }}
+[助手]:{% endif %}{%- endfor %}</code></pre>
+<h3>修改采样默认值 / 参数白名单</h3>
+<p>服务层面改默认采样（如强制 temperature 上限）：在 <code>vllm/entrypoints/openai/</code> 协议校验处（<code>protocol.py</code>）拦截；更干净的方式是前面加一层网关改写请求。</p>
+
+<h2><span class="sec-no">10.2</span>L2 插桩级定制：不改文件的钩子</h2>
+<p>第 06 章的 monkeypatch 就是这一级的工具。两个实用模板：</p>
+<div class="code-head"><span>python</span></div>
+<pre><code class="language-python"># 钩子1: 拦截所有进引擎的 prompt(做审计/改写)
+import vllm.v1.engine.async_llm as am
+orig = am.AsyncLLM.add_request
+async def audited_add(self, request_id, prompt, params, **kw):
+    print(f"[audit] {request_id}: {str(prompt)[:50]}")
+    return await orig(self, request_id, prompt, params, **kw)
+am.AsyncLLM.add_request = audited_add</code></pre>
+<p>另一个官方姿势是 <strong>plugin 机制</strong>（<code>vllm.general_plugins</code> 入口点组）：写一个包，在 <code>pyproject.toml</code> 里注册 <code>[project.entry-points."vllm.general_plugins"]</code>，vLLM 启动时自动加载——适合给团队做"无侵入"增强（自定义平台、注册模型、改平台检测等，这正是 vLLM 上游希望你扩展的方式）。</p>
+
+<h2><span class="sec-no">10.3</span>L3 模型级定制：让 vLLM 跑起你的新架构</h2>
+<h3>先问自己：真的需要写代码吗？</h3>
+<p>vLLM 的模型注册是<strong>按 <code>architectures</code> 名字</strong>匹配的。若你的模型只是"改了权重的 Llama"，不用写一行代码：</p>
+<div class="code-head"><span>python</span></div>
+<pre><code class="language-python"># 只要 HF config.json 里 architectures 是 vLLM 已支持的架构名, 直接就能跑:
+vllm serve /path/to/my-finetuned-llama   # finetune 不改变架构 → 直接支持</code></pre>
+<h3>真正的新架构：四步接入</h3>
+<p><strong>源码主战场：<code>vllm/model_executor/models/registry.py</code> + <code>models/</code> 目录。</strong></p>
+<div class="code-head"><span>text · 接入四步示意</span></div>
+<pre><code>Step 1  写模型类
+        在 vllm/model_executor/models/ 下新建 my_model.py:
+        - 定义 MyModel(nn.Module), forward(input_ids, positions, intermediate_tensors)
+        - 注意力必须用 vLLM 的统一层: from vllm.v1.attention... / model_executor.layers.attention
+          (自动接入调度器的 block_table 与 FlashAttention 后端 —— 第04/06章的机制在此接通)
+        - 实现 load_weights(weights): 把 HF safetensors 的权重名映射到自己的模块
+        - 附带 MyModelInfo: 告诉 vLLM 这个架构的参数规约(层数/头数从 config 读取的规则)
+
+Step 2  注册
+        registry.py 里 _MODELS 注册表加入: "MyModelForCausalLM": ("my_model", "MyModel")
+
+Step 3  让 HF config 能被识别
+        config.json 的 architectures 写上 "MyModelForCausalLM", model_type 相应登记
+
+Step 4  验证
+        vllm serve /path/to/my-model
+        # 对照启动日志: 加载权重 → profile → blocks 分配 → 出第一个 token</code></pre>
+<div class="viz" data-viz="journey-flow">
+  <div class="viz-head"><span class="dot"></span><span class="title">自定义模型接入全流程</span><span class="desc">四步接入拆成 9 步逐步走读 · 对应 10.3 节</span></div>
+  <div class="viz-body"></div>
+  <script type="application/json" class="viz-cfg">{"steps":[
+    {"title":"判断是否要写代码","detail":"vLLM 的模型注册按 <code>architectures</code> 名字匹配。若你的模型只是\"改了权重的 Llama\"（fine-tune 不改架构），不用写一行代码直接跑。","code":"vllm serve /path/to/my-finetuned-llama   # finetune 不改变架构 → 直接支持"},
+    {"title":"抄最近的现成实现","detail":"最省力的学习路径：抄一个结构最近的现成实现（如 <code>llama.py</code> 只有几百行），改名换骨。vLLM 300+ 个模型实现都是这么互相抄出来的。"},
+    {"title":"写模型类","detail":"在 <code>vllm/model_executor/models/</code> 下新建 my_model.py：定义 MyModel(nn.Module)，实现 forward(input_ids, positions, intermediate_tensors)。","code":"class MyModel(nn.Module):\n    def forward(self, input_ids, positions,\n                intermediate_tensors=None): ..."},
+    {"title":"注意力接统一层","detail":"注意力必须用 vLLM 的统一层（<code>vllm.v1.attention</code> / <code>model_executor.layers.attention</code>）——自动接入调度器的 block_table 与 FlashAttention 后端，第 04/06 章的机制在此接通。"},
+    {"title":"声明 MyModelInfo 参数规约","detail":"附带 MyModelInfo：告诉 vLLM 这个架构的参数规约——层数/头数从 config 读取的规则。"},
+    {"title":"实现 load_weights 权重映射","detail":"把 HF safetensors 的权重名映射到自己的模块。","code":"def load_weights(self, weights) -> None:\n    # HF safetensors 权重名 → 本模型模块名，逐项映射"},
+    {"title":"注册 Registry","detail":"<code>registry.py</code> 里 _MODELS 注册表加入映射。","code":"\"MyModelForCausalLM\": (\"my_model\", \"MyModel\")"},
+    {"title":"让 HF config 能被识别","detail":"config.json 的 architectures 写上 \"MyModelForCausalLM\"，model_type 相应登记。"},
+    {"title":"验证","detail":"对照启动日志走一遍：加载权重 → profile → blocks 分配 → 出第一个 token。","code":"vllm serve /path/to/my-model"}
+  ]}</script>
+</div>
+<p><strong>最省力的学习路径</strong>：抄一个结构最近的现成实现（如 <code>llama.py</code> 只有几百行），改名换骨。vLLM 300+ 个模型实现都是这么互相抄出来的。</p>
+<h3>定制采样行为（不改模型）</h3>
+<p>想要新的采样参数？路径：<code>SamplingParams</code>（<code>vllm/sampling_params.py</code>）→ <code>vllm/v1/sample/</code> 采样器中添加你的 logits 处理步骤 → OpenAI 协议层（<code>entrypoints/openai/protocol.py</code>）暴露字段。</p>
+
+<h2><span class="sec-no">10.4</span>L4 内核级：自定义注意力后端（了解即可）</h2>
+<p>当新架构有特殊注意力（如自定义稀疏模式）：</p>
+<ul>
+<li>位置：<code>vllm/v1/attention/backends/</code>，实现 <code>AttentionBackend</code> 抽象类（<code>interface.py</code>）：核心是 <code>build_metadata()</code> —— 把调度器给的 block_table 翻译成你内核需要的元数据；内核函数按 4.2 的块结构读 KV；</li>
+<li>参考实现：<code>flash_attn.py</code>（主路径）、<code>flashinfer.py</code>；</li>
+<li>通常需要 CUDA/Triton 内核配合，属于深度定制，绝大多数团队到 L3 为止。</li>
+</ul>
+
+<h2><span class="sec-no">10.5</span>定制开发工作流（避免踩坑）</h2>
+<ol>
+<li><strong>先在 vLLM 的 GitHub issue 搜</strong>：你想要的改动 90% 有人提过/做过；</li>
+<li><strong>开发用可编辑安装</strong>：<code>git clone</code> 源码 → <code>pip install -e .</code> → 改代码即时生效；</li>
+<li><strong>测试</strong>：<code>vllm/model_executor/models/</code> 对应模型有 <code>test_*</code>；跑 <code>pytest tests/v1/</code> 相关子集；</li>
+<li><strong>升级策略</strong>：定制代码集中在自己的文件 + 少量注册点，上游升级时只处理注册点冲突；</li>
+<li><strong>给上游提 PR</strong>：vLLM 社区对新模型 PR 非常活跃，贡献进去 = 永久免除维护负担。</li>
+</ol>
+
+<h2><span class="sec-no">10.6</span>动手实验（毕业设计）</h2>
+<h3>🚀 实验 10-1：注册一个"克隆模型"</h3>
+<div class="code-head"><span>bash</span></div>
+<pre><code class="language-bash"># 1. 找到 vLLM 源码目录(第03章方法), 复制 llama.py 为 myclone.py
+# 2. 全局替换类名 LlamaForCausalLM → MyCloneForCausalLM (注意同步改 registry 注册)
+# 3. 用一个 Qwen2.5-0.5B 的目录, 把 config.json 的 architectures 改成
+#    ["MyCloneForCausalLM"](Qwen2 架构与 Llama 同构, 权重可直接跑)
+# 4. vllm serve 后能正常对话 = 你的第一个 vLLM 模型接入完成 🎓</code></pre>
+<blockquote>这个实验看似"作弊"，实则走通了 L3 的全部机制：注册表匹配 → 模型类实例化 → load_weights 映射 → 调度器/注意力后端自动接通。真新架构只是把第 2 步的"抄"变成"写"。</blockquote>
+<h3>🔬 实验 10-2：给采样器加一个自定义 logits 处理</h3>
+<p>在 <code>vllm/v1/sample/</code> 找到采样器组装处，插入一个"禁用某个特定 token"的处理，验证输出中该 token 消失。（做结构化输出/敏感词过滤时会用到同类机制。）</p>
+
+<h2><span class="sec-no">10.7</span>本章小结 + 自测</h2>
+<details class="quiz">
+<summary>📋 本章自测</summary>
+<div class="quiz-body">
+<ol>
+<li>四个定制层级各自的适用场景和成本？</li>
+<li>fine-tune 过的 Llama 为什么不用写代码就能跑？vLLM 按 config 的什么字段选模型实现？</li>
+<li>新模型接入的四个步骤？哪一步连接了第 04 章的 block_table 机制？</li>
+<li>plugin 机制和 monkeypatch 各适合什么场景？</li>
+</ol>
+</div>
+</details>
+
+      <nav class="pager">
+        <a href="ch09.html"><div class="dir">← 上一章</div><div class="title">服务化部署与性能调优</div></a>
+        <a class="next" href="ch11.html"><div class="dir">下一章 →</div><div class="title">主流模型接入：DeepSeek / GLM / Qwen</div></a>
+      </nav>
+      <footer>vLLM 定制开发教程 · 可视化网页版 ｜ <a href="../index.html">返回目录</a></footer>
+    </article>
+  </div>
+</div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/visuals.js"></script>
+<script src="../assets/js/mathjax-tex-svg.js"></script>
+</body>
+</html>

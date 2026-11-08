@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 15 章 · 性能优化方法论与 TileLang 算子实战 ｜ vLLM 定制开发教程</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+  <a class="brand" href="../index.html">
+    <div class="logo">vLLM 定制开发教程</div>
+    <div class="sub">原理 + 实操，知行合一 · v0.31.0</div>
+  </a>
+  <nav>
+    <a href="../index.html"><span class="ch">🏠</span>课程首页</a>
+    <div class="nav-part">第一部分 · 打地基</div>
+    <a href="ch01.html"><span class="ch">01</span>大模型推理基础</a>
+    <a href="ch02.html"><span class="ch">02</span>环境安装与第一次推理</a>
+    <div class="nav-part">第二部分 · 核心原理</div>
+    <a href="ch03.html"><span class="ch">03</span>整体架构鸟瞰</a>
+    <a href="ch04.html"><span class="ch">04</span>PagedAttention 与 KV Cache</a>
+    <a href="ch05.html"><span class="ch">05</span>调度器与连续批处理</a>
+    <a href="ch06.html"><span class="ch">06</span>一次请求的完整旅程</a>
+    <div class="nav-part">第三部分 · 进阶</div>
+    <a href="ch07.html"><span class="ch">07</span>分布式并行 TP/PP/EP</a>
+    <a href="ch08.html"><span class="ch">08</span>高级特性</a>
+    <a href="ch09.html"><span class="ch">09</span>服务化部署与性能调优</a>
+    <div class="nav-part">第四部分 · 定制</div>
+    <a href="ch10.html"><span class="ch">10</span>接入自己的模型</a>
+    <a href="ch11.html"><span class="ch">11</span>DeepSeek/GLM/Qwen 接入</a>
+    <a href="ch12.html"><span class="ch">12</span>异构硬件部署</a>
+    <a href="ch13.html"><span class="ch">13</span>插件机制实现细节</a>
+    <div class="nav-part">第五部分 · 内核级</div>
+    <a href="ch14.html"><span class="ch">14</span>硬件与模型适配细节</a>
+    <a href="ch15.html"><span class="ch">15</span>性能优化与 TileLang</a>
+    <a href="ch16.html"><span class="ch">16</span>TileLang 内核开发指南</a>
+    <div class="nav-part">资料</div>
+    <a href="appendix.html"><span class="ch">附</span>速查表与常见问题</a>
+  </nav>
+</aside>
+  <div class="main">
+    <div class="topbar">
+      <button class="menu-btn">☰</button>
+      <div class="crumb"><b>第 15 章</b> · 性能优化与 TileLang</div>
+      <div class="reading-progress"></div>
+    </div>
+    <article class="content">
+      <header class="chapter-hero">
+        <div class="kicker">CHAPTER 15</div>
+        <h1>性能优化方法论与 TileLang 算子实战</h1>
+        <div class="badges"><span class="badge">🔖 vLLM v0.31.0</span><span class="badge lab">🔬 硬核实验</span></div>
+        <div class="goal">本章目标：掌握"优化"这门手艺的完整闭环——定位瓶颈 → 分类（算力/带宽）→ 用 TileLang 写/改内核 → 正确集成回 vLLM。TileLang 是 tile 级 DSL（TVM 编译器底座，Python 语法，官方版本线 0.1.x），也是 vLLM v0.31 的真实生产依赖（源码树内 <code>vllm/tilelang_utils/</code>、<code>vllm/model_executor/kernels/mhc/tilelang.py</code>、JIT warmup 体系）。配套三个渐进实验：<code>lab/tilelang/01 GEMM / 02 RMSNorm / 03 FlashAttention</code>（已通过语法检查）。</div>
+      </header>
+
+      <h2><span class="sec-no">15.0</span>优化的总路线图</h2>
+      <div class="code-head"><span>优化总路线图</span></div>
+      <pre><code>第14章: ncu/profiler 定位 → 判定 compute-bound 还是 memory-bound
+   │
+   ├─ memory-bound(归一化/逐元素/小 GEMM) → 拼: 合并访存、向量化、算子融合
+   ├─ compute-bound(大 GEMM/注意力)      → 拼: tile 调优、软件流水、TensorCore
+   └─ 都不满(小 kernel 铺天盖地)         → 拼: 融合 kernel / CUDA Graph(第03章)
+   │
+   ▼
+用 TileLang 重写该算子(本章 15.1~15.3) → 对拍 → 调 tile → 集成回 vLLM(15.6)
+</code></pre>
+      <p><strong>为什么选 TileLang 而不是手写 CUDA/Triton？</strong>三者的投入产出：手写 CUDA 最强但成本极高；Triton 生态大（vLLM 内大量使用）；TileLang 居中——<strong>用 30~50 行 Python 表达一个 FlashAttention</strong>，编译器自动生成 TensorCore 指令、双缓冲流水、bank-conflict 避免，同时保留 <code>T.annotate_layout</code> 等手动控制出口。尤其适合：快速原型 → 打平官方内核 → 必要时再下沉 CUDA。</p>
+
+      <h2><span class="sec-no">15.1</span>TileLang 编程模型：四级内存 + 五类原语</h2>
+      <p>（对应 <code>lab/tilelang/01_gemm_tilelang.py</code> 逐行讲解）</p>
+      <div class="code-head"><span>lab/tilelang/01_gemm_tilelang.py</span></div>
+      <pre><code class="language-python">@tilelang.jit(out_idx=[-1])           # JIT 编译; out_idx 声明"返回哪个参数作输出"
+def matmul(M, N, K, block_M=128, block_N=128, block_K=64, num_stages=3, threads=128):
+    @T.prim_func                      # ① kernel 本体
+    def main(A: T.Tensor((M, K), "float16"),
+             B: T.Tensor((K, N), "float16"),
+             C: T.Tensor((M, N), "float16")):
+        with T.Kernel(T.ceildiv(N, block_N),      # ② 网格: 每 tile 一个 CTA
+                      T.ceildiv(M, block_M), threads=threads) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), "float16")   # ③ 共享内存
+            C_local  = T.alloc_fragment((block_M, block_N), "float")   #    寄存器(FP32累加)
+            T.clear(C_local)
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):  # ④ 软件流水
+                T.copy(A[by * block_M, k * block_K], A_shared)          # ⑤ 数据搬运
+                T.gemm(A_shared, B_shared, C_local)                     #    TensorCore GEMM
+            T.copy(C_local, C[by * block_M, bx * block_N])
+    return main
+</code></pre>
+      <p><strong>五类原语速查</strong>（写 kernel 就用这五类）：</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>类别</th><th>API</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td>声明</td><td><code>T.Tensor / T.alloc_shared / T.alloc_fragment</code></td><td>全局内存 / 共享内存 / 寄存器 fragment</td></tr>
+          <tr><td>搬运</td><td><code>T.copy(src, dst)</code></td><td>编译器自动选向量化+异步拷贝路径</td></tr>
+          <tr><td>计算</td><td><code>T.gemm(A, B, C, transpose_B=, policy=)</code></td><td>自动映射 TensorCore；<code>policy=T.GemmWarpPolicy.FullRow</code> 控制 warp 分片</td></tr>
+          <tr><td>逐元素/规约</td><td><code>T.Parallel(i, j)</code> 循环、<code>T.reduce_max/sum</code>、<code>T.exp2/T.sqrt/T.max</code></td><td><code>T.Parallel</code> 是布局推导入口，编译器向量化</td></tr>
+          <tr><td>流程</td><td><code>T.Pipelined(n, num_stages=k)</code>、<code>T.fill / T.clear</code></td><td>多级缓冲流水；<code>T.exp2</code> 硬件加速(FA 里 <code>*scale</code> 常预乘进 log2e)</td></tr>
+        </tbody>
+      </table></div>
+      <p><strong>调优旋钮</strong>（对性能影响从大到小）：<code>block_M/N/K</code> → <code>num_stages</code> → <code>threads</code> → <code>T.use_swizzle</code>（地址交错防 bank conflict）→ <code>T.annotate_layout</code>（手动布局）→ PassConfig（15.6 讲 vLLM 怎么关 TMA/warp-specialization）。</p>
+
+      <h2><span class="sec-no">15.2</span>实验 1：GEMM（compute-bound 的标准打法）</h2>
+      <p><code>lab/tilelang/01_gemm_tilelang.py</code>。要点回顾：</p>
+      <ul>
+        <li><strong>累加器必须 fp32</strong>（<code>accum_dtype="float"</code>）——fp16 累加是精度事故的头号来源；</li>
+        <li><code>T.Pipelined(num_stages=3)</code>：编译器生成 global→smem 的多级预取流水，把"搬运等待"和"矩阵乘"重叠起来——这就是 cuBLAS 快的核心手法之一；</li>
+        <li>实验脚本自带 <code>torch.testing.assert_close</code> 对拍 + TFLOPS 计时与 cuBLAS 对比。</li>
+      </ul>
+      <p><strong>预期学习成果</strong>：在 4060 上，调优后的 TileLang GEMM 能到 cuBLAS 的 70~90%（fp16 1024³ 矩阵）。到不了 50% 说明 tile/pipeline 没调对——这正是实验要训练的手感。</p>
+      <div class="viz" data-viz="bar-compare">
+        <div class="viz-head"><span class="dot"></span><span class="title">GEMM 性能目标对比</span><span class="desc">数值取自正文：4060 · fp16 1024³ · TileLang 达 cuBLAS 的 70~90%</span></div>
+        <div class="viz-body"></div>
+        <script type="application/json" class="viz-cfg">{
+  "unit": "x",
+  "note": "场景：fp16 1024³ 矩阵 · RTX 4060（正文 15.2）。调优后的 TileLang GEMM 目标是 cuBLAS 的 70~90%；低于 50% 说明 tile/pipeline 没调对。RMSNorm 的同款标准：有效带宽 ≥ 显存理论带宽的 70%（15.3）。",
+  "items": [
+    {"label": "cuBLAS 基准", "value": 1.0, "color": "#22c55e", "badge": "1.0x"},
+    {"label": "TileLang 调优后", "value": 0.9, "color": "#4f9cf9", "badge": "0.7~0.9x"},
+    {"label": "未调对下限", "value": 0.5, "color": "#f87171", "badge": "低于 0.5x = 没调对"}
+  ]
+}</script>
+      </div>
+
+      <h2><span class="sec-no">15.3</span>实验 2：RMSNorm（memory-bound 的标准打法）</h2>
+      <p><code>lab/tilelang/02_rmsnorm_tilelang.py</code>。vLLM 每层都跑它（解码时每步 61 次量级），是"白捡延迟"的经典目标。与 GEMM 相反的优化哲学：</p>
+      <ul>
+        <li><strong>没有 matmul</strong> → 全部功夫在"让显存带宽跑满"；</li>
+        <li>每个 CTA 独占一行 → <code>T.Parallel(hidden_size)</code> 展开触发向量化访存；</li>
+        <li>reduce 用 <code>T.reduce_sum(x_f32, sqr_sum, dim=0)</code>；中间精度 fp32；</li>
+        <li>评价指标不是 TFLOPS 而是<strong>有效带宽 GB/s</strong>（脚本已内置计算：<code>(读x+读w+写y)/耗时</code>），对照你显卡的理论带宽算"吃了几成"。</li>
+      </ul>
+
+      <h2><span class="sec-no">15.4</span>实验 3：FlashAttention（两类的合体，本教程压轴）</h2>
+      <p><code>lab/tilelang/03_flash_attention_tilelang.py</code>。把第 01 章的注意力公式 + 第 04 章的块状思想变成 kernel，核心是<strong>在线 softmax</strong>：</p>
+      <div class="code-head"><span>在线 softmax（伪代码）</span></div>
+      <pre><code>每来一个 KV 块:
+  S = Q·K^T * scale            (TileLang: T.gemm(..., transpose_B=True) + T.Parallel 缩放/mask)
+  m_new = max(m_old, rowmax(S))              (T.reduce_max(dim=1, clear=True))
+  P   = exp2(S - m_new)                      (历史结果已用旧 max 归过, 需重缩放)
+  l_i = l_i * exp2(m_old - m_new) + rowsum(P)
+  O   = O * exp2(m_old - m_new) + P·V        (第二个 T.gemm, policy=FullRow)
+最后 O /= l_i
+</code></pre>
+      <p>三个性能细节（官方 example 同款）：</p>
+      <ol>
+        <li>用 <code>T.exp2</code> 而非 <code>exp</code>（GPU 有原生 exp2 指令），scale 预乘进 log2e；</li>
+        <li><code>S</code> 用 fp32 fragment 算 softmax，<code>T.copy</code> 成 fp16 fragment 再喂第二个 GEMM（<code>S_cast</code>——精度与 TensorCore 输入要求的平衡）；</li>
+        <li>causal mask 直接在 <code>T.Parallel</code> 循环里 <code>if</code> 置 <code>-inf</code>，无需额外 mask 张量。</li>
+      </ol>
+      <p>对拍基准用 <code>torch.nn.functional.scaled_dot_product_attention</code>——它内部就是官方 FlashAttention，<strong>你的 60 行 kernel 和工业级实现数值一致时，本课程闭环达成</strong>。</p>
+
+      <h2><span class="sec-no">15.5</span>生产集成四件事：vLLM 是怎么"收编" TileLang 的</h2>
+      <p>真实源码拆解（<code>vllm/tilelang_utils/__init__.py</code> 等，v0.31.0），写生产内核必须学会：</p>
+      <p><strong>① 平台门卫 + 延迟导入</strong>（第 14 章 14.3 已拆解的四条军规，出处即此文件）。</p>
+      <p><strong>② PassConfig：按平台裁剪编译器优化</strong></p>
+      <div class="code-head"><span>vllm/tilelang_utils/__init__.py（PassConfig）</span></div>
+      <pre><code class="language-python">@cache
+def _get_pass_configs():
+    pass_configs = {
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,   # 关 warp 专项化
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,          # 关 TMA 降级
+    }
+    if current_platform.is_cuda():
+        pass_configs[tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL] = 10  # 寄存器压力调优
+    return pass_configs
+</code></pre>
+      <p><strong>启示</strong>：<strong>激进优化 ≠ 万金油</strong>。vLLM 生产环境选择关掉两个最新特性换兼容性稳定（TMA 需要 Hopper+，warp-specialized 路径在部分场景出问题）——优化决策要绑定目标硬件。</p>
+      <p><strong>③ 延迟 JIT（<code>_DeferredTileLangJitKernel</code>）</strong>：内核不在 import 时编译，首次调用时才 <code>@tilelang.jit</code> 装饰——既加速进程启动，又适配"多平台共用代码"。</p>
+      <p><strong>④ Compile-only warmup（<code>warmup/jit_warmup_tilelang_helper.py</code>）</strong>：vLLM 启动期用假数据<strong>只编译不执行</strong>（<code>compile_tilelang</code> 直接填充 <code>_kernel_cache</code>），把 JIT 编译开销从"第一个真实请求"挪到启动阶段——与第 03 章 CUDA Graph 预录制是同一个哲学：<strong>运行期零意外</strong>。</p>
+      <p><strong>⑤ 注册为 torch custom op</strong>：真实内核（<code>kernels/mhc/tilelang.py</code>）用 <code>vllm.utils.torch_utils.direct_register_custom_op</code> 把 TileLang 函数注册成 <code>torch.library</code> custom op——使其在 <code>torch.compile</code>/CUDA Graph 中成为不可分的原子算子（避免图断裂）。<strong>这是任何自研内核接入 vLLM 执行图的标准姿势。</strong></p>
+      <p><strong>⑥ 双实现回退模式</strong>：同一位点的选择逻辑 <code>use_deep_gemm = is_deep_gemm_supported() or not use_tilelang_fallback</code>——硬件支持 DeepGEMM（NVIDIA 专属极致优化库）走 DeepGEMM，否则回退 TileLang 版。"<strong>专属极致 + 通用回退</strong>"的双路线是跨硬件内核工程的通用模式。</p>
+
+      <h2><span class="sec-no">15.6</span>优化 Checklist（把 15.1~15.5 收进口袋）</h2>
+      <p>写完 kernel 后按序自查：</p>
+      <ul>
+        <li>☐ 对拍通过？（多 shape、边界行、fp32 中间精度）</li>
+        <li>☐ 分类正确？compute-bound 调 tile/pipeline；memory-bound 拼带宽利用率</li>
+        <li>☐ 累加器 fp32？exp 用 exp2？mask 用 -inf 常量？</li>
+        <li>☐ tile size 扫过一轮？num_stages 扫过一轮？（脚本化 sweep）</li>
+        <li>☐ bank conflict？（ncu 看 l1tex 指标 / <code>T.use_swizzle</code>）</li>
+        <li>☐ 集成姿势：custom op 注册 + 平台门卫 + warmup + PassConfig 绑定目标硬件</li>
+        <li>☐ 有"通用回退路线"吗？低端卡/其他平台跑什么？</li>
+      </ul>
+
+      <h2><span class="sec-no">15.7</span>动手实验总表</h2>
+      <div class="table-wrap"><table>
+        <thead><tr><th>实验</th><th>文件</th><th>学习点</th><th>完成标准</th></tr></thead>
+        <tbody>
+          <tr><td>🚀 15-1 GEMM</td><td><code>lab/tilelang/01_*.py</code></td><td>tile/流水/TensorCore</td><td>TFLOPS 达到 cuBLAS ≥70%，记录最优配置</td></tr>
+          <tr><td>🚀 15-2 RMSNorm</td><td><code>lab/tilelang/02_*.py</code></td><td>带宽型优化</td><td>有效带宽 ≥ 显存理论带宽 70%</td></tr>
+          <tr><td>🚀 15-3 FlashAttention</td><td><code>lab/tilelang/03_*.py</code></td><td>在线 softmax 全流程</td><td>与 torch SDPA 数值一致</td></tr>
+          <tr><td>🔬 15-4 sweep</td><td>改 15-1 参数循环跑</td><td>参数敏感度地图</td><td>产出一张 block×stages 性能表</td></tr>
+          <tr><td>🔬 15-5 源码精读</td><td><code>vllm/tilelang_utils/__init__.py</code></td><td>生产集成模式</td><td>画出 15.5 六件事的调用图</td></tr>
+        </tbody>
+      </table></div>
+
+      <h2><span class="sec-no">15.8</span>本章小结 + 自测</h2>
+      <details class="quiz">
+        <summary>📋 本章自测</summary>
+        <div class="quiz-body">
+          <ol>
+            <li>TileLang 五类原语各是什么？<code>T.Parallel</code> 为什么被称为"布局推导入口"？</li>
+            <li>compute-bound 与 memory-bound 的 kernel 分别往哪里使劲？各自的成功指标？</li>
+            <li>在线 softmax 中，历史累加器为什么要乘 <code>exp2(m_old - m_new)</code>？不乘会怎样？</li>
+            <li>vLLM 为什么在生产 PassConfig 里关掉 warp-specialized 与 TMA lowering？</li>
+            <li><code>direct_register_custom_op</code> 解决什么问题？不注册会发生什么（提示：torch.compile/CUDA Graph）？</li>
+          </ol>
+        </div>
+      </details>
+      <blockquote><p>📚 <strong>深入篇</strong>：本章是 TileLang 入门（五类原语 + 三个基础 kernel）。工业级完全指南——MLA/GQA/MoE/W4A16 完整内核、昇腾等多硬件适配、vLLM 生产集成代码——见 <a href="ch16.html">第 16 章</a>。</p></blockquote>
+
+      <nav class="pager">
+        <a href="ch14.html"><div class="dir">← 上一章</div><div class="title">第 14 章 · 硬件与模型适配的代码级细节</div></a>
+        <a class="next" href="ch16.html"><div class="dir">下一章 →</div><div class="title">第 16 章 · TileLang 工业级内核开发完全指南</div></a>
+      </nav>
+      <footer>vLLM 定制开发教程 · 可视化网页版 ｜ <a href="../index.html">返回目录</a></footer>
+    </article>
+  </div>
+</div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/visuals.js"></script>
+<script src="../assets/js/mathjax-tex-svg.js"></script>
+</body>
+</html>

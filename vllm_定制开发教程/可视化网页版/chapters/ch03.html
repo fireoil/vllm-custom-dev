@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 03 章 · vLLM 整体架构鸟瞰 ｜ vLLM 定制开发教程</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+  <a class="brand" href="../index.html">
+    <div class="logo">vLLM 定制开发教程</div>
+    <div class="sub">原理 + 实操，知行合一 · v0.31.0</div>
+  </a>
+  <nav>
+    <a href="../index.html"><span class="ch">🏠</span>课程首页</a>
+    <div class="nav-part">第一部分 · 打地基</div>
+    <a href="ch01.html"><span class="ch">01</span>大模型推理基础</a>
+    <a href="ch02.html"><span class="ch">02</span>环境安装与第一次推理</a>
+    <div class="nav-part">第二部分 · 核心原理</div>
+    <a href="ch03.html"><span class="ch">03</span>整体架构鸟瞰</a>
+    <a href="ch04.html"><span class="ch">04</span>PagedAttention 与 KV Cache</a>
+    <a href="ch05.html"><span class="ch">05</span>调度器与连续批处理</a>
+    <a href="ch06.html"><span class="ch">06</span>一次请求的完整旅程</a>
+    <div class="nav-part">第三部分 · 进阶</div>
+    <a href="ch07.html"><span class="ch">07</span>分布式并行 TP/PP/EP</a>
+    <a href="ch08.html"><span class="ch">08</span>高级特性</a>
+    <a href="ch09.html"><span class="ch">09</span>服务化部署与性能调优</a>
+    <div class="nav-part">第四部分 · 定制</div>
+    <a href="ch10.html"><span class="ch">10</span>接入自己的模型</a>
+    <a href="ch11.html"><span class="ch">11</span>DeepSeek/GLM/Qwen 接入</a>
+    <a href="ch12.html"><span class="ch">12</span>异构硬件部署</a>
+    <a href="ch13.html"><span class="ch">13</span>插件机制实现细节</a>
+    <div class="nav-part">第五部分 · 内核级</div>
+    <a href="ch14.html"><span class="ch">14</span>硬件与模型适配细节</a>
+    <a href="ch15.html"><span class="ch">15</span>性能优化与 TileLang</a>
+    <a href="ch16.html"><span class="ch">16</span>TileLang 内核开发指南</a>
+    <div class="nav-part">资料</div>
+    <a href="appendix.html"><span class="ch">附</span>速查表与常见问题</a>
+  </nav>
+</aside>
+  <div class="main">
+    <div class="topbar">
+      <button class="menu-btn">☰</button>
+      <div class="crumb"><b>第 03 章</b> · vLLM 整体架构鸟瞰</div>
+      <div class="reading-progress"></div>
+    </div>
+    <article class="content">
+      <header class="chapter-hero">
+        <div class="kicker">CHAPTER 03</div>
+        <h1>vLLM 整体架构鸟瞰</h1>
+        <div class="badges"><span class="badge">🔖 vLLM v0.31.0</span><span class="badge lab">🔧 动手实验</span></div>
+        <div class="goal">本章目标：建立 vLLM 的"地图"。学完你能说出：一个请求从进来到出去，经过哪几个进程、哪几个模块；看启动日志不再懵；看到源码目录知道往哪儿翻。（所有文件路径均对照 vLLM <strong>v0.31.0</strong> 真实源码树核对）</div>
+      </header>
+
+      <h2><span class="sec-no">3.1</span>一张总图：四个世界</h2>
+      <p>把 vLLM 想象成一家"高级餐厅"：</p>
+      <div class="code-head"><span>示意 · 四个世界（分层总图）</span></div>
+      <pre><code class="language-text">┌────────────────────────────────────────────────────────────────────────┐
+│ 世界一：前台 API 层（进程1，跑 FastAPI）                                  │
+│   接待客人、翻译菜单、收发消息 —— 但不做菜                                 │
+│   vllm/entrypoints/openai/api_server.py（FastAPI 路由）                  │
+├────────────────────────────────────────────────────────────────────────┤
+│ 世界二：引擎调度层（进程2，EngineCore）                                   │
+│   大堂经理：决定谁上桌、几个人一桌、桌子不够了让谁腾                       │
+│   vllm/v1/engine/core.py + vllm/v1/core/sched/scheduler.py              │
+├────────────────────────────────────────────────────────────────────────┤
+│ 世界三：模型执行层（进程2内 或 每张GPU一个进程）                           │
+│   后厨：真正拿锅炒菜（跑模型前向计算）                                    │
+│   vllm/v1/worker/gpu_worker.py + gpu_model_runner.py                    │
+├────────────────────────────────────────────────────────────────────────┤
+│ 世界四：算子/内核层（CUDA/Triton 库）                                     │
+│   菜刀案板：FlashAttention、GEMM 内核等最底层的数学计算                    │
+│   vllm/v1/attention/backends/ + vllm/model_executor/layers/             │
+└────────────────────────────────────────────────────────────────────────┘</code></pre>
+      <div class="viz" data-viz="arch-diagram">
+        <div class="viz-head"><span class="dot"></span><span class="title">vLLM 架构分层图</span><span class="desc">点击任意组件，查看职责与源码位置（对应 3.1 节）</span></div>
+        <script type="application/json" class="viz-cfg">{"layers":[{"name":"世界一 · 前台 API 层（进程 1 · FastAPI）","color":"#4f9cf9","items":[{"name":"api_server.py","desc":"FastAPI 路由（vllm/entrypoints/openai/api_server.py）：接待客人、翻译菜单、收发消息——但不做菜"},{"name":"AsyncLLM","desc":"在线服务前端（vllm/v1/engine/async_llm.py）：HTTP 请求经它进入引擎，支持流式输出"},{"name":"LLM（离线入口）","desc":"vllm/entrypoints/llm.py：脚本实验、批量处理，同步包装 EngineCore"}]},{"name":"世界二 · 引擎调度层（进程 2 · EngineCore）","color":"#a78bfa","items":[{"name":"EngineCore / EngineCoreProc","desc":"引擎主循环（vllm/v1/engine/core.py）：独立子进程里的高速循环，与 HTTP 的 asyncio 事件循环 GIL 隔离、故障隔离"},{"name":"Scheduler","desc":"大堂经理（vllm/v1/core/sched/scheduler.py）：决定谁上桌、几个人一桌、桌子不够了让谁腾"},{"name":"KVCacheManager / BlockPool","desc":"KV 显存管理（vllm/v1/core/kv_cache_manager.py + block_pool.py）：物理块池 + 前缀缓存哈希表"},{"name":"OutputProcessor / Detokenizer","desc":"把 token 流还原成 RequestOutput（vllm/v1/engine/output_processor.py + detokenizer.py：token id → 文字）"}]},{"name":"世界三 · 模型执行层（进程 2 内 / 每张 GPU 一个进程）","color":"#22c55e","items":[{"name":"GPUWorker","desc":"单卡 worker（vllm/v1/worker/gpu_worker.py）：初始化、显存摸底（profile_run）"},{"name":"GPUModelRunner","desc":"准备输入 / 跑前向 / 录制 CUDA Graph（vllm/v1/worker/gpu_model_runner.py）"}]},{"name":"世界四 · 算子/内核层（CUDA / Triton 库）","color":"#f59e0b","items":[{"name":"Attention Backends","desc":"各注意力后端（vllm/v1/attention/backends/）：FlashAttention 等最底层的数学计算"},{"name":"model_executor/layers","desc":"自定义算子层（vllm/model_executor/layers/：Linear / Attention / RMSNorm...）"},{"name":"models/ 300+ 模型实现","desc":"vllm/model_executor/models/：各模型架构实现（第 10 章定制模型的主角）"},{"name":"Platform 平台抽象","desc":"vllm/platforms/：CUDA / ROCm / CPU / NPU 等硬件平台抽象"}]}]}</script>
+        <div class="viz-body"></div>
+      </div>
+      <p><strong>为什么前台和厨房分成两个进程？</strong> 三个原因（V1 架构最重要的设计决策）：</p>
+      <ol>
+        <li><strong>GIL 隔离</strong>：Python 的全局锁会拖累高频调度循环。引擎子进程（EngineCoreProc）里是纯 Python 高速循环，与处理 HTTP 的 asyncio 事件循环互不干扰；</li>
+        <li><strong>故障隔离</strong>：内核崩溃（CUDA error）不会拖垮 API 服务，还能被监控重启；</li>
+        <li><strong>可扩展</strong>：多卡/多机时，EngineCore 可以指挥多个 Worker 进程，前台完全无感。</li>
+      </ol>
+      <p>进程间通过 <strong>ZMQ 消息队列</strong>（+ 共享内存传大块 tensor）通信，这是 V1 架构"AsyncLLM ↔ EngineCore"的标准协议。</p>
+
+      <h2><span class="sec-no">3.2</span>两种入口，一套核心</h2>
+      <div class="table-wrap">
+      <table>
+        <thead><tr><th>入口</th><th>文件</th><th>用途</th><th>去向</th></tr></thead>
+        <tbody>
+          <tr><td><code>LLM(...)</code> 离线</td><td><code>vllm/entrypoints/llm.py</code></td><td>脚本实验、批量处理</td><td>同步包装 EngineCore</td></tr>
+          <tr><td><code>vllm serve</code> 在线</td><td><code>vllm/entrypoints/openai/api_server.py</code> + <code>vllm/v1/engine/async_llm.py</code>（类 <code>AsyncLLM</code>）</td><td>生产 API 服务</td><td>HTTP → AsyncLLM → EngineCore</td></tr>
+        </tbody>
+      </table>
+      </div>
+      <p><strong>记住这张关系图（本课程的主旋律）：</strong></p>
+      <div class="code-head"><span>示意 · 调用关系图</span></div>
+      <pre><code class="language-text"> 用户请求
+    │  HTTP (OpenAI 格式)
+    ▼
+api_server.py  (FastAPI, 进程1)
+    │  AsyncLLM.generate / add_request
+    ▼
+AsyncLLM  ──(ZMQ)──▶  EngineCoreProc  (进程2)
+                        │ 每步循环:
+                        │   1. Scheduler.schedule()      ← 谁可以跑（第05章）
+                        │   2. GPUModelRunner.execute_model() ← 真算（第06章）
+                        │   3. 把新 token 发回去
+                        ▼
+                     Worker / GPU</code></pre>
+
+      <h2><span class="sec-no">3.3</span>源码目录地图（v0.31.0 真实结构）</h2>
+      <div class="code-head"><span>vllm/ 源码目录树</span></div>
+      <pre><code class="language-text">vllm/
+├── engine/
+│   └── arg_utils.py          # ★ 所有引擎参数的集中定义（学习参数时的字典）
+├── entrypoints/
+│   ├── llm.py                # LLM 离线类
+│   └── openai/api_server.py  # ★ FastAPI 服务与所有 /v1/* 路由
+├── v1/                       # ★★★ V1 引擎主体（本课程核心）
+│   ├── engine/
+│   │   ├── async_llm.py      #   AsyncLLM：在线服务前端
+│   │   ├── core.py           #   ★ EngineCore/EngineCoreProc：引擎主循环
+│   │   ├── output_processor.py#  把 token 流 → RequestOutput（含分词还原）
+│   │   └── detokenizer.py    #   token id → 文字
+│   ├── core/
+│   │   ├── kv_cache_manager.py   # ★ KV 显存管理（第04章主角）
+│   │   ├── block_pool.py         # ★ 物理块池 + 前缀缓存哈希表
+│   │   ├── kv_cache_utils.py     #   块大小的数学计算
+│   │   └── sched/
+│   │       └── scheduler.py      # ★★ 调度器（第05章主角，vLLM 最重要的文件之一）
+│   ├── worker/
+│   │   ├── gpu_worker.py         #   单卡上的 worker：初始化、显存探测
+│   │   └── gpu_model_runner.py   # ★★ ModelRunner：准备输入/跑前向/CUDA Graph
+│   ├── attention/backends/       #   各注意力后端（flash_attn 等）
+│   ├── sample/                   #   采样器
+│   ├── spec_decode/              #   投机解码（第08章）
+│   ├── structured_output/        #   结构化输出（第08章）
+│   └── metrics/                  #   Prometheus 指标
+├── model_executor/
+│   ├── models/               # ★ 300+ 个模型实现（第10章主角：定制模型）
+│   └── layers/               #   自定义算子层（Linear/Attention/RMSNorm...）
+├── transformers_utils/       #   加载 HuggingFace config/tokenizer
+├── platforms/                #   硬件平台抽象（CUDA/ROCm/CPU/NPU...）
+└── distributed/              #   多卡通信（第07章）</code></pre>
+      <div class="callout info"><strong>学习方法</strong>：不需要读完全部源码。本课程只精读 6 个文件（标注 ★★ 的优先），合计约几千行，却是 vLLM 90% 的灵魂。</div>
+
+      <h2><span class="sec-no">3.4</span>一次启动，vLLM 做了什么？</h2>
+      <p><code>LLM(...)</code> 构造函数（或 serve 启动）的内部时间线——<strong>建议对照启动日志读一遍</strong>：</p>
+      <div class="code-head"><span>示意 · 启动时间线</span></div>
+      <pre><code class="language-text">[1] 解析配置      EngineArgs → 各 Config 对象（arg_utils.py 里 500+ 个参数）
+[2] 创建引擎进程   EngineCoreProc（子进程），加载 tokenizer
+[3] 加载模型权重   dtype/量化判断 → 从 HF 下载/读取 safetensors → 装载到 GPU
+[4] 显存摸底      Worker.profile_run()：用假数据跑一遍前向，测出
+                  "模型+激活"实际吃掉多少显存
+[5] 分配 KV Cache 可用显存 = 总显存 × gpu_memory_utilization − 摸底结果
+                  按 block_size(16 token) 切块 → 得到 "# GPU blocks: N"
+                  一次性预分配整块 KV Cache 张量（之后运行期不再向 PyTorch 要显存!）
+[6] CUDA Graph    把 decode 阶段的前向录制为 CUDA Graph，消除逐层 kernel 启动开销
+[7] 就绪          打印 "Maximum concurrency"，开始服务</code></pre>
+      <p><strong>步骤 [4][5] 是 vLLM 显存哲学的精髓</strong>：先测量再分配，把"剩余显存"全部变成 KV Cache 座位，运行期完全静态化——避免了 PyTorch 缓存分配器的抖动，这是它能塞下更多请求的物理基础。</p>
+
+      <h2><span class="sec-no">3.5</span>动手实验</h2>
+      <p>✅ <strong>实验 3-1（必做）</strong>：带 DEBUG 日志启动，亲眼看到上述步骤：</p>
+      <div class="code-head"><span>bash</span></div>
+      <pre><code class="language-bash">VLLM_LOGGING_LEVEL=INFO vllm serve Qwen/Qwen2.5-0.5B-Instruct --max-model-len 1024 2&gt;&amp;1 | tee serve.log</code></pre>
+      <p>对照 3.4 的时间线，在 <code>serve.log</code> 里找到每个阶段对应的日志行，做上标注。</p>
+      <p>✅ <strong>实验 3-2（必做）</strong>：服务启动后，问它要配置快照：</p>
+      <div class="code-head"><span>bash</span></div>
+      <pre><code class="language-bash">curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model":"Qwen/Qwen2.5-0.5B-Instruct","messages":[{"role":"user","content":"hi"}]}'
+curl http://localhost:8000/metrics | grep -E "num_requests_(running|waiting)"   # Prometheus 指标</code></pre>
+      <p>压测时反复请求 <code>/metrics</code>，观察 <code>running</code>（正在跑的请求数）和 <code>waiting</code>（排队数）的消长——这就是调度器（第 05 章）在实时工作。</p>
+      <p>✅ <strong>实验 3-3（选做）</strong>：在自己环境里翻源码。装完 vLLM 后：</p>
+      <div class="code-head"><span>bash</span></div>
+      <pre><code class="language-bash">python -c "import vllm, os; print(os.path.dirname(vllm.__file__))"
+# 用编辑器打开该目录，对照 3.3 的地图逐个打开标注 ★ 的文件
+# 只看：文件开头 docstring、class 定义、主要 public 方法签名。不要陷进细节！</code></pre>
+
+      <nav class="pager">
+        <a href="ch02.html"><div class="dir">← 上一章</div><div class="title">环境安装与第一次推理</div></a>
+        <a class="next" href="ch04.html"><div class="dir">下一章 →</div><div class="title">KV Cache 与 PagedAttention</div></a>
+      </nav>
+      <footer>vLLM 定制开发教程 · 可视化网页版 ｜ <a href="../index.html">返回目录</a></footer>
+    </article>
+  </div>
+</div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/visuals.js"></script>
+<script src="../assets/js/mathjax-tex-svg.js"></script>
+</body>
+</html>

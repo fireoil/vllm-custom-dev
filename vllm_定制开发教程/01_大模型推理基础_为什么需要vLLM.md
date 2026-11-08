@@ -62,21 +62,23 @@ Transformer 的注意力机制需要"拿当前 token 与**所有历史 token** �
 
 公式（每个 token 的 KV 大小）：
 
-```
-KV大小/token = 2 (K和V) × 层数 × KV头数 × 每头维度 × 每元素字节数
-```
+$$
+S_{kv} = \underbrace{2}_{K,V} \times L \times H_{kv} \times d_{head} \times \text{每元素字节数}
+$$
+
+其中 $L$ 为层数，$H_{kv}$ 为 KV 头数，$d_{head}$ 为每头维度。
 
 以 **Qwen2.5-7B**（FP16）为例：28 层、GQA 4 个 KV 头、每头 128 维、2 字节：
 
-```
-2 × 28 × 4 × 128 × 2 = 57,344 字节 ≈ 56 KB / token
-```
+$$
+2 \times 28 \times 4 \times 128 \times 2 = 57{,}344 \text{ 字节} \approx 56 \text{ KB/token}
+$$
 
 **结论一览（FP16）：**
 
 | 模型 | 每 token KV | 生成 1000 token | 4096 token 上下文 |
 |---|---|---|---|
-| Qwen2.5-0.5B | ≈ 3.5 KB | 3.5 MB | 14 MB |
+| Qwen2.5-0.5B | ≈ 12 KB | 12 MB | 49 MB |
 | Qwen2.5-7B | ≈ 56 KB | 56 MB | 224 MB |
 | Llama-3-70B | ≈ 320 KB | 320 MB | 1.3 GB |
 

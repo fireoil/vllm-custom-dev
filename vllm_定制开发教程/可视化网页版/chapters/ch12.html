@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 12 章 · 异构硬件部署指南 ｜ vLLM 定制开发教程</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+  <a class="brand" href="../index.html">
+    <div class="logo">vLLM 定制开发教程</div>
+    <div class="sub">原理 + 实操，知行合一 · v0.31.0</div>
+  </a>
+  <nav>
+    <a href="../index.html"><span class="ch">🏠</span>课程首页</a>
+    <div class="nav-part">第一部分 · 打地基</div>
+    <a href="ch01.html"><span class="ch">01</span>大模型推理基础</a>
+    <a href="ch02.html"><span class="ch">02</span>环境安装与第一次推理</a>
+    <div class="nav-part">第二部分 · 核心原理</div>
+    <a href="ch03.html"><span class="ch">03</span>整体架构鸟瞰</a>
+    <a href="ch04.html"><span class="ch">04</span>PagedAttention 与 KV Cache</a>
+    <a href="ch05.html"><span class="ch">05</span>调度器与连续批处理</a>
+    <a href="ch06.html"><span class="ch">06</span>一次请求的完整旅程</a>
+    <div class="nav-part">第三部分 · 进阶</div>
+    <a href="ch07.html"><span class="ch">07</span>分布式并行 TP/PP/EP</a>
+    <a href="ch08.html"><span class="ch">08</span>高级特性</a>
+    <a href="ch09.html"><span class="ch">09</span>服务化部署与性能调优</a>
+    <div class="nav-part">第四部分 · 定制</div>
+    <a href="ch10.html"><span class="ch">10</span>接入自己的模型</a>
+    <a href="ch11.html"><span class="ch">11</span>DeepSeek/GLM/Qwen 接入</a>
+    <a href="ch12.html"><span class="ch">12</span>异构硬件部署</a>
+    <a href="ch13.html"><span class="ch">13</span>插件机制实现细节</a>
+    <div class="nav-part">第五部分 · 内核级</div>
+    <a href="ch14.html"><span class="ch">14</span>硬件与模型适配细节</a>
+    <a href="ch15.html"><span class="ch">15</span>性能优化与 TileLang</a>
+    <a href="ch16.html"><span class="ch">16</span>TileLang 内核开发指南</a>
+    <div class="nav-part">资料</div>
+    <a href="appendix.html"><span class="ch">附</span>速查表与常见问题</a>
+  </nav>
+</aside>
+  <div class="main">
+    <div class="topbar">
+      <button class="menu-btn">☰</button>
+      <div class="crumb"><b>第 12 章</b> · 异构硬件部署</div>
+      <div class="reading-progress"></div>
+    </div>
+    <article class="content">
+      <header class="chapter-hero">
+        <div class="kicker">CHAPTER 12</div>
+        <h1>异构硬件部署指南：NVIDIA / AMD / Intel / CPU / 昇腾</h1>
+        <div class="badges"><span class="badge">🔖 vLLM v0.31.0</span><span class="badge lab">🔧 动手实验</span></div>
+        <div class="goal">本章目标：讲清 vLLM 的硬件抽象层——同一套调度/KV 管理代码，如何在完全不同的芯片上跑起来；以及每种硬件的真实安装部署步骤。（平台文件对照 vLLM v0.31.0：vllm/platforms/ 下有 interface.py、cuda.py、rocm.py、cpu.py、xpu.py、tpu.py、zen_cpu.py）</div>
+      </header>
+
+<h2><span class="sec-no">12.0</span>核心设计：一套引擎，多种芯片</h2>
+<p>回忆第 03 章架构图。vLLM 的聪明之处在于：<strong>调度器、KV Cache 管理、API 层、采样器都是纯 Python + 平台无关逻辑</strong>，真正与芯片绑定的只有三处：</p>
+<div class="table-wrap"><table>
+<thead><tr><th>平台相关部位</th><th>内容</th><th>对应抽象</th></tr></thead>
+<tbody>
+<tr><td>注意力/矩阵内核</td><td>FlashAttention、GEMM 等数学实现</td><td>attention backends（第 11 章 MLA 一族就是范例）</td></tr>
+<tr><td>通信</td><td>NCCL / RCCL / oneCCL</td><td><code>vllm/distributed/device_communicators/</code>（cuda/xpu/cpu 各有 communicator）</td></tr>
+<tr><td>Worker 执行</td><td>显存摸底、CUDA Graph、kernel 启动</td><td><code>vllm/platforms/interface.py</code> 的 <code>Platform</code> 抽象类</td></tr>
+</tbody>
+</table></div>
+<p><code>vllm/platforms/__init__.py</code> 提供 <strong><code>current_platform</code></strong> 单例：启动时自动检测硬件并实例化对应的 Platform 子类，之后引擎所有"这是 N 卡还是 A 卡"的分叉都问它。</p>
+<p><strong>内置平台 5 种</strong>：CUDA（NVIDIA）、ROCm（AMD）、CPU、XPU（Intel）、TPU（Google）。<strong>不在内置列表的芯片怎么办？→ 插件机制</strong>（下一节，也是本章最重要的一页）。</p>
+<div class="viz" data-viz="arch-diagram">
+  <div class="viz-head"><span class="dot"></span><span class="title">Platform 平台抽象与硬件适配链路</span><span class="desc">上层平台无关，芯片绑定集中在三处 · 对应 12.0 节</span></div>
+  <div class="viz-body"></div>
+  <script type="application/json" class="viz-cfg">{"layers":[
+    {"name":"平台无关层 · 一套引擎（纯 Python）","color":"#4f9cf9","items":[
+      {"name":"调度器","desc":"连续批处理、抢占等调度逻辑——纯 Python 平台无关（第 05 章）"},
+      {"name":"KV Cache 管理","desc":"PagedAttention 块管理，纯 Python 平台无关（第 04 章）"},
+      {"name":"API 层","desc":"OpenAI 协议服务，纯 Python 平台无关"},
+      {"name":"采样器","desc":"logits 处理与 token 选择，纯 Python 平台无关"}]},
+    {"name":"平台仲裁 · current_platform 单例","color":"#f59e0b","items":[
+      {"name":"current_platform","desc":"vllm/platforms/__init__.py 提供：启动时自动检测硬件并实例化对应的 Platform 子类；引擎所有\"这是 N 卡还是 A 卡\"的分叉都问它"}]},
+    {"name":"平台绑定三处","color":"#ec4899","items":[
+      {"name":"注意力/矩阵内核","desc":"FlashAttention、GEMM 等数学实现 → attention backends（第 11 章 MLA 一族就是范例）"},
+      {"name":"通信","desc":"NCCL / RCCL / oneCCL → vllm/distributed/device_communicators/（cuda/xpu/cpu 各有 communicator）"},
+      {"name":"Worker 执行","desc":"显存摸底、CUDA Graph、kernel 启动 → vllm/platforms/interface.py 的 Platform 抽象类"}]},
+    {"name":"硬件插件层","color":"#22c55e","items":[
+      {"name":"内置 5 平台","desc":"CUDA（NVIDIA）/ ROCm（AMD）/ CPU / XPU（Intel）/ TPU（Google）"},
+      {"name":"vllm.platform_plugins","desc":"不在内置列表的芯片怎么办 → 插件机制注册自定义平台（第 13 章）"},
+      {"name":"AscendPlatform","desc":"昇腾插件：device 类型与显存查询换 npu-smi 体系，Worker/ModelRunner 换 NPU 版，注意力内核与 CCL 通信按昇腾算子库适配"}]}
+  ]}</script>
+</div>
+
+<h2><span class="sec-no">12.1</span>硬件插件机制：以昇腾 vllm-ascend 为范例</h2>
+<p>华为昇腾 NPU 不在 vLLM 内置平台里，但它是 vLLM 官方背书的<strong>硬件插件参考实现</strong>（vLLM 团队 2025 年 5 月官方博客《Introducing vLLM Hardware Plugin, Best Practice from Ascend NPU》）。它的接入原理，正是第 13 章插件体系的"平台插件组"：</p>
+<div class="code-head"><span>text · vllm-ascend 接入原理示意</span></div>
+<pre><code>vllm-ascend 包的 pyproject 里注册了 vllm.platform_plugins 入口点
+        │
+        ▼
+vLLM 初始化 current_platform 时发现该插件 → 加载 AscendPlatform
+        │
+        ▼
+AscendPlatform 替换/扩展默认行为:
+    - device 类型、显存查询方式(npn-smi 体系)
+    - Worker / ModelRunner 换成 NPU 版实现
+    - 注意力内核、通信库(CCL)按昇腾算子库适配
+        │
+        ▼
+对用户而言: 引擎层一切照旧 —— vllm serve 命令参数几乎不变</code></pre>
+<p><strong>这就是"解耦"的商业价值</strong>：芯片厂商不必往 vLLM 主仓塞几千行硬件代码，vLLM 核心也不被单一硬件绑架；版本对齐通过"vllm-ascend 版本线跟随上游 vLLM 版本线"解决（例如 vllm-ascend v0.30.x 对齐上游 vLLM v0.30，2026-10 发布的 v0.30.0rc1 即与 vLLM v0.30.0 通过 main2main 流程对齐）。</p>
+
+<h2><span class="sec-no">12.2</span>分硬件部署实操</h2>
+<h3>① NVIDIA CUDA（基线，本教程演示机）</h3>
+<div class="code-head"><span>bash</span></div>
+<pre><code class="language-bash">pip install -U vllm          # 轮子自带 CUDA 运行时, 只需驱动够新
+vllm serve Qwen/Qwen2.5-0.5B-Instruct</code></pre>
+<p>要点：TP 优先 NVLink 机器（第 07 章）；日志 <code># GPU blocks</code> 是容量规划第一指标。</p>
+<h3>② AMD ROCm</h3>
+<div class="code-head"><span>bash</span></div>
+<pre><code class="language-bash"># 方式一: 官方 Docker(最省心)
+docker run --ipc=host --shm-size 16G --device /dev/kfd --device /dev/dri \
+  -p 8000:8000 rocm/vllm:latest \
+  vllm serve Qwen/Qwen2.5-7B-Instruct
+
+# 方式二: pip (ROCm 版 torch 轮子)
+python3 -m pip install vllm --extra-index-url https://download.pytorch.org/whl/rocm6.4</code></pre>
+<p>要点：</p>
+<ul>
+<li>ROCm 版支持的模型/量化集合略窄于 CUDA（MLA 有 <code>aiter_triton_mla.py</code> 专供 AMD）；</li>
+<li>通信库换成了 RCCL（NCCL 的 AMD 等价物）——对你是透明的；</li>
+<li>模型兼容性以官方 "AMD 安装与支持矩阵" 文档为准。</li>
+</ul>
+<h3>③ Intel XPU（含 Arc / Gaudi 路线）</h3>
+<div class="code-head"><span>bash</span></div>
+<pre><code class="language-bash"># 平台抽象文件: vllm/platforms/xpu.py
+# 安装遵循 Intel 官方仓库(vllm fandom 文档 / intel-extension-for-pytorch 指南)
+pip install vllm --extra-index-url https://download.pytorch.org/whl/xpu
+vllm serve Qwen/Qwen2.5-1.5B-Instruct --device xpu</code></pre>
+<p>要点：XPU 通信走 oneCCL（<code>device_communicators/xpu_communicator.py</code>）；生态成熟度弱于 CUDA，新特性跟进通常滞后数个版本，<strong>生产选型前必跑官方支持矩阵</strong>。</p>
+<h3>④ 纯 CPU（本教程 8% 场景的救星）</h3>
+<div class="code-head"><span>bash</span></div>
+<pre><code class="language-bash">pip install vllm --extra-index-url https://download.pytorch.org/whl/cpu
+# 平台抽象: vllm/platforms/cpu.py(+ zen_cpu.py 针对 AMD Zen 优化)
+vllm serve Qwen/Qwen2.5-0.5B-Instruct --max-model-len 1024</code></pre>
+<p>要点：0.5~1.5B 模型 + 短上下文可实用；学习 API/流程/插件开发完全够用；MLA 都有 CPU 实现（<code>amx_mla.py</code>，Intel AMX 指令加速）。</p>
+<h3>⑤ 华为昇腾 NPU（国产主力）</h3>
+<div class="code-head"><span>bash</span></div>
+<pre><code class="language-bash"># 1. 确认驱动(推荐 HDK 25.5.0+)
+npu-smi info
+
+# 2. 官方容器(推荐, 免去版本对齐烦恼) —— vllm-ascend 发布线对齐上游 vLLM
+docker run --rm --name vllm-ascend --net=host --shm-size=1g \
+  --device /dev/davinci0 \
+  quay.io/ascend/vllm-ascend:v0.13.0rc3 \
+  vllm serve deepseek-ai/DeepSeek-R1-Distill-Qwen-7B
+
+# 3. 或 pip 双装(注意: vllm 与 vllm-ascend 版本必须成对!)
+pip install vllm==0.9.2 vllm-ascend==0.9.2rc1</code></pre>
+<p>要点（截至 2026-10 的 vllm-ascend v0.30.0rc1）：</p>
+<ul>
+<li><strong>版本纪律是第一铁律</strong>：vllm 与 vllm-ascend 版本线必须配对，跨线混装必出玄学错误；</li>
+<li>旗舰适配以"模型×硬件组合"白名单发布（该版本聚焦 DeepSeek V4.1、GLM-5.3、Qwen3.8 等旗舰模型），白名单外的组合"能跑"不代表"承诺支持"；</li>
+<li>深度优化方向：大规模专家并行、PD 分离部署、KV Cache Pool、TurboQuant 低比特 KV——都是第 04~09 章原理在另一种芯片上的再现。</li>
+</ul>
+<h3>⑥ Google TPU（了解）</h3>
+<p><code>vllm/platforms/tpu.py</code>；需 GCP 环境 + 专用轮子，JAX/Pallas 内核路线，属于特定云上场景，用到时查官方 TPU 文档即可。</p>
+
+<h2><span class="sec-no">12.3</span>跨硬件通用排错心法</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>症状</th><th>排查方向</th></tr></thead>
+<tbody>
+<tr><td>启动就崩、怀疑平台没对</td><td><code>python -c "from vllm.platforms import current_platform; print(current_platform)"</code> 看检测结果</td></tr>
+<tr><td>报错提到某 kernel 不存在</td><td>该硬件未实现此内核 → 查平台支持矩阵/换模型/换量化</td></tr>
+<tr><td>性能远低于官方数据</td><td>确认是否在官方白名单"模型×硬件×并行"组合内</td></tr>
+<tr><td>多卡起不来</td><td>通信库问题：NCCL/RCCL/CCL 环境变量与版本</td></tr>
+</tbody>
+</table></div>
+
+<h2><span class="sec-no">12.4</span>动手实验</h2>
+<p>✅ <strong>实验 12-1（必做）</strong>：平台自省</p>
+<div class="code-head"><span>bash</span></div>
+<pre><code class="language-bash">python3 -c "
+from vllm.platforms import current_platform as p
+print('平台:', p)                      # 本机应显示 CudaPlatform
+print('设备名:', p.get_device_name())
+"</code></pre>
+<p>✅ <strong>实验 12-2（推荐）</strong>：同一命令在两种硬件跑通。用 CPU 版 vLLM（单独 venv）跑 <code>first_run.py</code>，对比 CUDA 版的吞吐差距（通常 10~50 倍）——<strong>体会"引擎逻辑相同、内核不同、性能天差地别"</strong>，这正是本章的题眼。</p>
+<p>🔬 <strong>实验 12-3（选做）</strong>：读 <code>vllm/platforms/interface.py</code> 的 <code>Platform</code> 抽象类，列出至少 5 个"平台必须回答的问题"（如 <code>is_cuda()</code>、显存查询、graph 模式支持…），再打开 <code>cuda.py</code> 看答案——硬件插件要做的就是把这些问题全部答一遍。</p>
+
+<h2><span class="sec-no">12.5</span>本章小结 + 自测</h2>
+<details class="quiz">
+<summary>📋 本章自测</summary>
+<div class="quiz-body">
+<ol>
+<li>vLLM 平台相关的三个绑定部位是什么？哪些层是平台无关的？</li>
+<li><code>current_platform</code> 在什么时候、由谁决定？</li>
+<li>昇腾接入用的插件组是哪个？版本对齐的铁律是什么？</li>
+<li>为什么说 MLA 后端族（第 11 章）是"硬件抽象"的最佳案例？</li>
+<li>ROCm 与 CUDA 部署的主要差异点（装法/通信库/内核集合）？</li>
+</ol>
+</div>
+</details>
+
+      <nav class="pager">
+        <a href="ch11.html"><div class="dir">← 上一章</div><div class="title">主流模型接入：DeepSeek / GLM / Qwen</div></a>
+        <a class="next" href="ch13.html"><div class="dir">下一章 →</div><div class="title">vLLM 插件机制实现细节</div></a>
+      </nav>
+      <footer>vLLM 定制开发教程 · 可视化网页版 ｜ <a href="../index.html">返回目录</a></footer>
+    </article>
+  </div>
+</div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/visuals.js"></script>
+<script src="../assets/js/mathjax-tex-svg.js"></script>
+</body>
+</html>

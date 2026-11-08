@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 05 章 · 调度器与连续批处理 ｜ vLLM 定制开发教程</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+  <a class="brand" href="../index.html">
+    <div class="logo">vLLM 定制开发教程</div>
+    <div class="sub">原理 + 实操，知行合一 · v0.31.0</div>
+  </a>
+  <nav>
+    <a href="../index.html"><span class="ch">🏠</span>课程首页</a>
+    <div class="nav-part">第一部分 · 打地基</div>
+    <a href="ch01.html"><span class="ch">01</span>大模型推理基础</a>
+    <a href="ch02.html"><span class="ch">02</span>环境安装与第一次推理</a>
+    <div class="nav-part">第二部分 · 核心原理</div>
+    <a href="ch03.html"><span class="ch">03</span>整体架构鸟瞰</a>
+    <a href="ch04.html"><span class="ch">04</span>PagedAttention 与 KV Cache</a>
+    <a href="ch05.html"><span class="ch">05</span>调度器与连续批处理</a>
+    <a href="ch06.html"><span class="ch">06</span>一次请求的完整旅程</a>
+    <div class="nav-part">第三部分 · 进阶</div>
+    <a href="ch07.html"><span class="ch">07</span>分布式并行 TP/PP/EP</a>
+    <a href="ch08.html"><span class="ch">08</span>高级特性</a>
+    <a href="ch09.html"><span class="ch">09</span>服务化部署与性能调优</a>
+    <div class="nav-part">第四部分 · 定制</div>
+    <a href="ch10.html"><span class="ch">10</span>接入自己的模型</a>
+    <a href="ch11.html"><span class="ch">11</span>DeepSeek/GLM/Qwen 接入</a>
+    <a href="ch12.html"><span class="ch">12</span>异构硬件部署</a>
+    <a href="ch13.html"><span class="ch">13</span>插件机制实现细节</a>
+    <div class="nav-part">第五部分 · 内核级</div>
+    <a href="ch14.html"><span class="ch">14</span>硬件与模型适配细节</a>
+    <a href="ch15.html"><span class="ch">15</span>性能优化与 TileLang</a>
+    <a href="ch16.html"><span class="ch">16</span>TileLang 内核开发指南</a>
+    <div class="nav-part">资料</div>
+    <a href="appendix.html"><span class="ch">附</span>速查表与常见问题</a>
+  </nav>
+</aside>
+  <div class="main">
+    <div class="topbar">
+      <button class="menu-btn">☰</button>
+      <div class="crumb"><b>第 05 章</b> · 调度器与连续批处理</div>
+      <div class="reading-progress"></div>
+    </div>
+    <article class="content">
+      <header class="chapter-hero">
+        <div class="kicker">CHAPTER 05</div>
+        <h1>调度器与连续批处理（GPU 不停转的秘密）</h1>
+        <div class="badges"><span class="badge">🔖 vLLM v0.31.0</span><span class="badge lab">🔧 动手实验</span></div>
+        <div class="goal">本章目标：搞懂 vLLM 每一"步"（step）里调度器做的所有决定——收谁、切多长、放不放、抢谁的。学完你能读懂调度日志、并用 <code>--max-num-seqs</code> / <code>--max-num-batched-tokens</code> 等参数做定向调优。</div>
+      </header>
+
+      <h2><span class="sec-no">5.1</span>连续批处理：从"整桌结账"到"即来即走"</h2>
+      <p><strong>静态批处理（传统）</strong>像老式食堂：凑够 8 个人一桌，<strong>整桌吃完才清桌</strong>。</p>
+      <div class="code-head"><span>示意 · 静态批处理</span></div>
+      <pre><code class="language-text">一批请求: [R1要3步][R2要25步][R3要4步]...
+实际过程: R1 第3步完成 → 座位空转 22 步; R3 第4步完成 → 继续空转...
+GPU 每步 batch 变小 → 每步的有效算力占比不断下滑</code></pre>
+      <p><strong>连续批处理（Continuous Batching / In-flight batching，Orca 论文 2022 提出、vLLM 发扬光大）</strong>：调度器以"<strong>每生成一个 token 为一个节拍（step）</strong>"，每个节拍：</p>
+      <ol>
+        <li>谁完成了？→ 立刻让出座位，吐出结果</li>
+        <li>有空位吗？→ 立刻接纳新请求（先做它的 prefill）</li>
+        <li>剩下所有人 → 一起 decode 一步</li>
+      </ol>
+      <p>座位<strong>从不空转</strong>，吞吐量因此成倍提升（第 01 章埋的伏笔在这里兑现）。</p>
+      <div class="viz" data-viz="batch-sim">
+        <div class="viz-head"><span class="dot"></span><span class="title">静态批处理 vs 连续批处理</span><span class="desc">动画对比：看座位何时空转、新请求何时进场</span></div>
+        <div class="viz-body"></div>
+      </div>
+
+      <h2><span class="sec-no">5.2</span>调度器的一个节拍：schedule() 全流程</h2>
+      <p>源码：<code>vllm/v1/core/sched/scheduler.py</code> 的 <code>Scheduler.schedule()</code>。它是 vLLM 最重要、也最值得读的一个函数。逻辑骨架（伪代码）：</p>
+      <div class="code-head"><span>vllm/v1/core/sched/scheduler.py（伪代码）</span></div>
+      <pre><code class="language-python">def schedule(self) -&gt; SchedulerOutput:
+    # ① 本步预算：最多处理多少 token、最多带多少请求
+    token_budget = self.max_num_batched_tokens     # 默认 8192
+    seq_budget   = self.max_num_seqs               # 默认 1024（V1 默认 1024，早期 256）
+
+    # ② 优先"还债"：上步被抢占的请求要恢复（其 KV 需重新 prefill）
+    # ③ 再续"旧客"：running 队列里的请求，每人预支 1 token 做 decode（开销固定）
+    # ④ 然后接"新客"：从 waiting 队列弹请求做 prefill：
+    #      - KVCacheManager.allocate_slots() 失败(块不够) → 停止接客
+    #      - prompt 太长放不下预算 → chunked prefill 切片, 本步只算一部分
+    # ⑤ 若连 decode 的 1 token/请求都放不下 → 抢占(preempt):
+    #      挑最新/最小的请求, 释放它的 KV 块, 塞回 waiting 头部(RECOMPUTE 策略)
+    # ⑥ 打包 SchedulerOutput: 每个请求的 block_table、采样参数、待 decode 列表...</code></pre>
+      <p><strong>三个关键机制展开：</strong></p>
+      <h3>① Chunked Prefill：把大请求的 prefill 切成"小口吃"</h3>
+      <p>问题：一个 8000 token 的 prompt 一步算完，会把整步时间拖到几百毫秒，排在后面的所有 decode 请求的 <strong>ITL（逐 token 间隔）</strong>全部卡顿——流式用户体验骤降。</p>
+      <p>方案（V1 <strong>默认开启</strong>）：prefill 按预算切片，比如每步只吃 2048 token。副作用几乎没有（prefill 之间可以混入别人的 decode），收益是流式延迟大幅平滑。这也是 V1 架构相对 V0 的重大简化：<strong>调度器不再区分 prefill 批和 decode 批，统一混批</strong>。</p>
+      <h3>② 抢占（Preemption）：块不够时牺牲谁？</h3>
+      <p>当所有请求的 KV 块加起来超了（<code>allocate_slots</code> 返回 None）：vLLM 选择<strong>抢占</strong>而不是拒绝——把某个请求的 KV 全部释放、请求塞回队列最前，等下次轮到它时<strong>从上次断点重新 prefill</strong>（RECOMPUTE 策略）。被抢占者优先选"最晚进来的"（损失最小）。</p>
+      <blockquote>
+        <p>为什么"重算"反而合理？因为 KV 块是稀缺资源：牺牲一个请求的已算成果，换回几块显存让 N 个请求继续出 token，净收益为正。这就是第 04 章实验 4-3 日志里 <code>Preempted ... (RECOMPUTE)</code> 的含义。</p>
+      </blockquote>
+      <h3>③ 两级队列与顺序</h3>
+      <ul>
+        <li><code>waiting</code>（新请求 + 被抢占恢复的）按到达顺序（默认 FCFS，也支持优先级调度）</li>
+        <li><code>running</code>（本步在跑的）</li>
+      </ul>
+      <p>预算顺序：<strong>被抢占恢复 &gt; running decode &gt; waiting prefill</strong>——先保证已承诺的请求不被饿死。</p>
+
+      <h2><span class="sec-no">5.3</span>每步之后：token 怎么变成流式回复</h2>
+      <p>节拍结束，EngineCore 把每请求的<strong>新增 token id</strong> 发回前端：</p>
+      <div class="code-head"><span>output_processor.py 调用链</span></div>
+      <pre><code class="language-text">output_processor.py (vllm/v1/engine/output_processor.py)
+  → detokenizer.py: token id → 文字（增量分词还原，处理 UTF-8 截断）
+  → 按 request_id 推进对应 asyncio.Queue
+  → api_server 把它包装成 SSE 流发给客户端</code></pre>
+      <p>对用户而言就是"打字机效果"；对 vLLM 而言，每一步都可能是某个请求的最后一个 token——它退场、座位释放、新请求进场，循环往复。</p>
+
+      <h2><span class="sec-no">5.4</span>调度相关参数速查（背下来，调优时用）</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>参数</th><th>默认</th><th>作用</th><th>什么时候动它</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>--max-num-seqs</code></td><td>1024</td><td>同批最多请求数</td><td>小显存/小模型调小（如 32~128），防碎批拖慢单步</td></tr>
+            <tr><td><code>--max-num-batched-tokens</code></td><td>8192</td><td>每步 token 预算</td><td>追求低 ITL 可调小；追求吞吐可调大</td></tr>
+            <tr><td><code>--max-num-partial-prefills</code></td><td>1</td><td>同时允许几个"切了一半"的 prefill</td><td>长 prompt 多时调大</td></tr>
+            <tr><td><code>--long-prefill-token-threshold</code></td><td>0（不切）</td><td>超过该长度才触发 chunked prefill</td><td>混合长短请求时调优</td></tr>
+            <tr><td><code>--num-scheduler-steps</code></td><td>1</td><td>每次前向内部连跑几步（多步调度）</td><td>一般不动</td></tr>
+            <tr><td><code>--scheduling-policy</code></td><td>fcfs</td><td>fcfs / priority</td><td>有优先级业务需求时</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout warn"><p>V0 时代还有 <code>--swap-space</code>（CPU 交换 KV）与抢占 SWAP 策略；V1 以 RECOMPUTE 为主，并引入了 KV offload 等新机制（第 08 章）。看到旧教程讲 SWAP 策略要意识到版本差异。</p></div>
+
+      <h2><span class="sec-no">5.5</span>动手实验</h2>
+      <h3>🔧 实验 5-1（零门槛，必做）：模拟器对比两种批处理</h3>
+      <div class="code-head"><span>bash</span></div>
+      <pre><code class="language-bash">python3 lab/sim_continuous_batching.py</code></pre>
+      <p>8 个输出长度参差的请求：静态批处理 <strong>45 步</strong>、连续批处理 <strong>26 步</strong>，"GPU 利用率（近似）"从 <strong>51% 提到 81%</strong>。请：</p>
+      <ol>
+        <li>对照 5.2 的骨架伪代码，在模拟器 <code>run_continuous()</code> 里找出 ①预算 ②接纳 ③decode ④完成让位四个阶段各对应哪几行；</li>
+        <li>把 <code>MAX_NUM_SEQS</code> 改成 2 再跑，观察总步数变化（座位少了→排队变长）；</li>
+        <li>思考：模拟器里的 <code>token_budget</code> 对应哪个真实参数？chunked prefill 在模拟器哪一行发生？</li>
+      </ol>
+      <h3>🚀 实验 5-2（真机）：max_num_seqs 压测</h3>
+      <div class="code-head"><span>bash</span></div>
+      <pre><code class="language-bash">python3 lab/real_vllm_bench.py</code></pre>
+      <p>对比 <code>max_num_seqs=4</code> 与 <code>32</code> 的吞吐。Qwen2.5-0.5B 这类小模型 decode 极快，更大 batch 未必更快——<strong>这正是 5.4 参数表"什么时候动它"的现实体现</strong>，也是第 09 章调优的总纲：<strong>没有万能参数，只有场景匹配</strong>。</p>
+      <h3>🔬 实验 5-3（硬核）：给真调度器插桩（先完成第 06 章再回来做也行）</h3>
+      <div class="code-head"><span>bash</span></div>
+      <pre><code class="language-bash">python -c "import vllm,os;print(os.path.dirname(vllm.__file__))"
+# 打开 &lt;该目录&gt;/v1/core/sched/scheduler.py, 在 schedule() 入口加:
+#   logger.info("step: running=%d waiting=%d budget=%d",
+#               len(self.running), len(self.waiting), self.max_num_batched_tokens)
+# 重启 serve, 用实验 4-3 的大并发脚本压测, tail 日志观察三个数字的实时变化</code></pre>
+      <p>你会看到：<code>waiting</code> 高峰 → 逐步消化进 <code>running</code> → 满载时 <code>running≈max_num_seqs</code>。把这张"心电图"截图存档——它就是连续批处理的具象化。</p>
+
+      <h2><span class="sec-no">5.6</span>本章小结 + 自测</h2>
+      <details class="quiz">
+        <summary>📋 本章自测</summary>
+        <div class="quiz-body">
+          <ol>
+            <li>连续批处理相比静态批处理，解决的是<strong>空间</strong>问题还是<strong>时间</strong>问题？</li>
+            <li><code>max_num_batched_tokens</code> 和 <code>max_num_seqs</code> 分别约束什么维度？</li>
+            <li>画出 schedule() 的预算消费顺序（谁先谁后）。</li>
+            <li>被抢占的请求恢复时，为什么需要重新 prefill？（提示：它的 KV 怎么了）</li>
+            <li>一个 20000 token 的 prompt 到达后，它的 prefill 会发生几次前向计算？受哪个参数控制？</li>
+          </ol>
+        </div>
+      </details>
+
+      <nav class="pager">
+        <a href="ch04.html"><div class="dir">← 上一章</div><div class="title">PagedAttention 与 KV Cache</div></a>
+        <a class="next" href="ch06.html"><div class="dir">下一章 →</div><div class="title">一次请求的完整旅程（源码走读）</div></a>
+      </nav>
+      <footer>vLLM 定制开发教程 · 可视化网页版 ｜ <a href="../index.html">返回目录</a></footer>
+    </article>
+  </div>
+</div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/visuals.js"></script>
+<script src="../assets/js/mathjax-tex-svg.js"></script>
+</body>
+</html>

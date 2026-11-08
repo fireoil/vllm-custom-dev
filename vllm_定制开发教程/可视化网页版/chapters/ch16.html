@@ -1,0 +1,1163 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 16 章 · TileLang 工业级内核开发完全指南 ｜ vLLM 定制开发教程</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+  <a class="brand" href="../index.html">
+    <div class="logo">vLLM 定制开发教程</div>
+    <div class="sub">原理 + 实操，知行合一 · v0.31.0</div>
+  </a>
+  <nav>
+    <a href="../index.html"><span class="ch">🏠</span>课程首页</a>
+    <div class="nav-part">第一部分 · 打地基</div>
+    <a href="ch01.html"><span class="ch">01</span>大模型推理基础</a>
+    <a href="ch02.html"><span class="ch">02</span>环境安装与第一次推理</a>
+    <div class="nav-part">第二部分 · 核心原理</div>
+    <a href="ch03.html"><span class="ch">03</span>整体架构鸟瞰</a>
+    <a href="ch04.html"><span class="ch">04</span>PagedAttention 与 KV Cache</a>
+    <a href="ch05.html"><span class="ch">05</span>调度器与连续批处理</a>
+    <a href="ch06.html"><span class="ch">06</span>一次请求的完整旅程</a>
+    <div class="nav-part">第三部分 · 进阶</div>
+    <a href="ch07.html"><span class="ch">07</span>分布式并行 TP/PP/EP</a>
+    <a href="ch08.html"><span class="ch">08</span>高级特性</a>
+    <a href="ch09.html"><span class="ch">09</span>服务化部署与性能调优</a>
+    <div class="nav-part">第四部分 · 定制</div>
+    <a href="ch10.html"><span class="ch">10</span>接入自己的模型</a>
+    <a href="ch11.html"><span class="ch">11</span>DeepSeek/GLM/Qwen 接入</a>
+    <a href="ch12.html"><span class="ch">12</span>异构硬件部署</a>
+    <a href="ch13.html"><span class="ch">13</span>插件机制实现细节</a>
+    <div class="nav-part">第五部分 · 内核级</div>
+    <a href="ch14.html"><span class="ch">14</span>硬件与模型适配细节</a>
+    <a href="ch15.html"><span class="ch">15</span>性能优化与 TileLang</a>
+    <a href="ch16.html"><span class="ch">16</span>TileLang 内核开发指南</a>
+    <div class="nav-part">资料</div>
+    <a href="appendix.html"><span class="ch">附</span>速查表与常见问题</a>
+  </nav>
+</aside>
+  <div class="main">
+    <div class="topbar">
+      <button class="menu-btn">☰</button>
+      <div class="crumb"><b>第 16 章</b> · TileLang 内核开发指南</div>
+      <div class="reading-progress"></div>
+    </div>
+    <article class="content">
+      <header class="chapter-hero">
+        <div class="kicker">CHAPTER 16</div>
+        <h1>TileLang 工业级内核开发完全指南：DeepSeek / GLM / Qwen 多硬件推理加速</h1>
+        <div class="badges"><span class="badge">🔖 vLLM v0.31.0</span><span class="badge lab">🔬 硬核实验</span></div>
+        <div class="goal">本章定位：第 15 章带你用 TileLang 写出了 GEMM / RMSNorm / FlashAttention 三个入门内核；本章是它的工业级完全版——目标是让你具备把 DeepSeek（MLA/MoE/FP8）、GLM、Qwen（GQA/QK-Norm/MoE/W4A16）的关键算子用 TileLang 实现出来，并同一份源码适配 NVIDIA / AMD / 昇腾 NPU / Apple，最终以 vLLM 生产标准（custom op / warmup / 平台门卫 / 回退链）集成回推理引擎。版本基线：TileLang v0.1.15（2026-09-30，含官方 Ascend 950 后端）+ vLLM v0.31.0（与本教程全系列一致）。TileLang 迭代很快（0.1.x 线），个别 API 以<a href="https://tilelang.com/">官方文档</a>为准，但编程模型与工程方法长期稳定。</div>
+      </header>
+
+      <p><strong>与全系列的协同地图</strong>（先知道每一节和前面哪章"接力"）：</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>本章节</th><th>前置章节</th><th>前置 lab</th></tr></thead>
+        <tbody>
+          <tr><td>16.5 DeepSeek MLA / Paged KV</td><td><a href="ch04.html">第 04 章</a>、<a href="ch11.html">第 11 章</a></td><td><code>lab/sim_paged_kv.py</code>、<code>lab/tilelang/03</code></td></tr>
+          <tr><td>16.6 GQA / MoE / W4A16</td><td><a href="ch11.html">第 11 章</a>、<a href="ch08.html">第 08 章</a></td><td><code>lab/tilelang/01、02</code></td></tr>
+          <tr><td>16.7 跨硬件</td><td><a href="ch12.html">第 12 章</a>、<a href="ch14.html">第 14 章</a></td><td>—</td></tr>
+          <tr><td>16.8 vLLM 集成</td><td><a href="ch13.html">第 13 章</a>、<a href="ch15.html">第 15 章</a></td><td><code>lab/my_vllm_plugin/</code></td></tr>
+          <tr><td>16.9 性能工程</td><td><a href="ch09.html">第 09 章</a>、<a href="ch14.html">第 14 章</a></td><td><code>lab/tilelang/01~03</code></td></tr>
+        </tbody>
+      </table></div>
+
+      <h2><span class="sec-no">16.0</span>全景：TileLang 生态与选型决策</h2>
+      <h3>16.0.1 一句话定位</h3>
+      <p>TileLang（tile-lang）是构建在 TVM 之上的 <strong>tile 级 DSL</strong>：用 Pythonic 语法描述"一个 CTA 算多大一块数据、怎么在内存层级间搬运、怎么调 TensorCore"，编译器自动完成<strong>布局推导、向量化、软件流水、TMA/WGMMA 指令映射、bank-conflict 规避</strong>，同时保留 <code>T.annotate_layout</code> 等手动控制出口。产出物是可直接从 Python 调用的编译内核（也可导出源码）。</p>
+      <h3>16.0.2 tile-ai 生态六件套（知道有这些，别重复造轮子）</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>项目</th><th>是什么</th><th>什么时候用</th></tr></thead>
+        <tbody>
+          <tr><td><a href="https://github.com/tile-ai/tilelang">tilelang</a></td><td>语言本体 + 编译器（本章主角）</td><td>写/改内核</td></tr>
+          <tr><td><a href="https://github.com/tile-ai/TileOPs">TileOPs</a></td><td>官方高性能算子库（varlen GQA、W4A16 长 K、DeltaNet、FlashMLA 系等）</td><td>先找现成算子，再决定是否自己写</td></tr>
+          <tr><td><a href="https://github.com/tile-ai/TileRT">TileRT</a></td><td>tile 级推理运行时（GLM-5.1 生产于 Z.ai、DeepSeek-V3.2、1000+ TPS 案例；经 vLLM V1 connector 做 PD 分离）</td><td>极致单流解码速度的参考/替代</td></tr>
+          <tr><td><a href="https://github.com/tile-ai/tilelang-ascend">tilelang-ascend</a></td><td>昇腾早期后端（<code>ascendc_pto</code> / <code>npuir</code> 两分支，2025-09 起）</td><td>昇腾 910B 等上一代 NPU</td></tr>
+          <tr><td><a href="https://github.com/tile-ai/TileSight">TileSight</a></td><td>tile 中心的分析式性能模型（CPU 侧预估算子耗时/缓存流量）</td><td>写 kernel 前估算 roofline</td></tr>
+          <tr><td><a href="https://github.com/tile-ai/tilelang-puzzles">tilelang-puzzles</a> / <a href="https://github.com/tile-ai/tilelang-lsp">tilelang-lsp</a></td><td>10 道渐进编程题 / LSP（IDE 内联提示 buffer 形状、dtype、layout）</td><td>学习与开发体验</td></tr>
+        </tbody>
+      </table></div>
+      <h3>16.0.3 与其他内核技术路线的对比</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>维度</th><th>手写 CUDA / CUTLASS</th><th>Triton</th><th><strong>TileLang</strong></th><th>DeepGEMM / 专属库</th></tr></thead>
+        <tbody>
+          <tr><td>生产力</td><td>低（数百行）</td><td>高</td><td><strong>高（30~80 行一个 FA）</strong></td><td>开箱即用</td></tr>
+          <tr><td>性能上限</td><td>最高</td><td>高</td><td><strong>高（官方 MLA 打平 FlashMLA / Aiter）</strong></td><td>特定 shape 最高</td></tr>
+          <tr><td>硬件覆盖</td><td>每硬件重写一遍</td><td>NVIDIA / AMD</td><td><strong>NVIDIA / AMD / 昇腾 / Metal / CPU(LLVM) / CuTeDSL / WebGPU</strong></td><td>绑定特定硬件</td></tr>
+          <tr><td>布局与流水控制</td><td>全手动</td><td>半自动</td><td><strong>自动推导 + 可手动（annotate_layout / PassConfig）</strong></td><td>内置</td></tr>
+          <tr><td>vLLM 中的地位</td><td>内核仓大量</td><td>主力</td><td><strong>v0.31 起为生产依赖</strong>（<code>has_tilelang</code>、<code>vllm/tilelang_utils/</code>）</td><td>DeepSeek 路线主力</td></tr>
+          <tr><td>学习曲线</td><td>陡</td><td>缓</td><td><strong>缓→中</strong>（会 Python 就能起步）</td><td>无（直接用）</td></tr>
+        </tbody>
+      </table></div>
+      <h3>16.0.4 选型决策树（背下来，别上来就写 kernel）</h3>
+      <div class="code-head"><span>选型决策树</span></div>
+      <pre><code>要不要自己写 kernel？
+├─ ① 官方专属库已覆盖且硬件支持（DeepGEMM/FlashMLA/FlashInfer/Aiter）→ 直接用
+├─ ③ vLLM 内置 Triton/CUDA 后端性能已达标 → 直接用（第14章内核选择链路）
+├─ 满足任一条 → 用 TileLang 写（②层，本章）：
+│    · 硬件不被官方库支持（昇腾 NPU / 新卡 / 低配消费卡）
+│    · 算子融合机会明确（QK-Norm+RoPE、dequant+GEMM、gate+grouped-GEMM）
+│    · 模型结构定制（MLA 变体、新注意力、稀疏/线性注意力）
+└─ ② TileLang 到不了目标性能、需要特殊指令 → 再下沉手写 CUDA
+</code></pre>
+      <h3>16.0.5 TileLang 在 vLLM 里的真实存在感（不是玩具）</h3>
+      <ul>
+        <li><code>vllm.utils.import_utils.has_tilelang</code>：tilelang 是 vLLM 的<strong>可选依赖</strong>，探针函数专门检测它；</li>
+        <li><code>vllm/tilelang_utils/</code>：延迟 JIT 内核封装 + 编译期 warmup 体系（15.5 已拆解）；</li>
+        <li><code>vllm/model_executor/kernels/mhc/tilelang.py</code>：真实生产内核 + custom op 注册；</li>
+        <li>vLLM 2026-10 的 DeepSeek-V4.1-Flash 适配中，内核层（MegaAttention/Mega-mHC 等）与 TileLang 生态同属"内核加速层"，遵循同一套集成规范（16.8 展开实现）。</li>
+      </ul>
+
+      <h2><span class="sec-no">16.1</span>环境安装与硬件支持矩阵</h2>
+      <h3>16.1.1 安装（三种方式，国内环境友好）</h3>
+      <div class="code-head"><span>安装（bash）</span></div>
+      <pre><code class="language-bash"># 方式一: PyPI(国内走清华源)
+pip install tilelang -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 方式二: 跟随 main 分支(特性最新, 风险自担)
+pip install git+https://github.com/tile-ai/tilelang.git
+
+# 方式三: 源码(需要改编译器/加后端时)
+git clone --recursive https://github.com/tile-ai/tilelang.git
+cd tilelang &amp;&amp; pip install -e .
+</code></pre>
+      <p><strong>版本红线</strong>：Python ≥ 3.9（3.8 支持止于 v0.1.6.post2）；torch 与 CUDA 按你现有 vLLM 环境不动，tilelang 只是"多装一个包"，与 vLLM 共存无冲突（它自己捆绑 TVM 运行时）。</p>
+      <p><strong>容器化模板</strong>（配合你"容器内开发、不动宿主机"的惯例）：</p>
+      <div class="code-head"><span>Dockerfile（vLLM v0.31 + TileLang v0.1.15 共存）</span></div>
+      <pre><code class="language-dockerfile">FROM nvcr.io/nvidia/pytorch:24.10-py3
+# ---- 国内源 ----
+RUN sed -i 's|archive.ubuntu.com|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list &amp;&amp; \
+    pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+# ---- vLLM v0.31 + TileLang v0.1.15 共存 ----
+RUN pip install vllm==0.31.0 tilelang==0.1.15 &amp;&amp; \
+    pip install jupyterlab ipykernel
+</code></pre>
+      <p>安装验证：</p>
+      <div class="code-head"><span>安装验证（bash）</span></div>
+      <pre><code class="language-bash">python -c "import tilelang; print(tilelang.__version__)"     # 0.1.15
+python -c "from vllm.utils.import_utils import has_tilelang; print(has_tilelang())"  # True
+</code></pre>
+      <h3>16.1.2 硬件支持矩阵（选后端就是选这张表）</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>硬件</th><th>Tensor Core / 矩阵单元</th><th>TileLang 支持状态</th><th>备注</th></tr></thead>
+        <tbody>
+          <tr><td>NVIDIA V100 / A100 / 3090 / 4090 / A6000</td><td>mma</td><td><strong>官方测试通过</strong></td><td>消费卡（含本教程 4060 级别）可用</td></tr>
+          <tr><td>NVIDIA H100/H200</td><td>WGMMA + TMA</td><td><strong>Auto TMA/WGMMA</strong>（官方测试）</td><td>warp-specialization 可用但可关</td></tr>
+          <tr><td>NVIDIA Blackwell（B200/RTX50）</td><td>tcgen05</td><td>v0.1.12+ 扩展；<code>T.mma_gemm_blockscaled</code>（SM120 NVF4）</td><td>FP4/FP8 块缩放 MMA</td></tr>
+          <tr><td>AMD MI250</td><td>Matrix Core</td><td>官方测试通过（自动映射）</td><td>ROCm 后端</td></tr>
+          <tr><td>AMD MI300X / MI355X</td><td>Matrix Core + AsyncCopy</td><td>官方测试；FlashMLA 打平 Aiter 汇编内核</td><td>TileRT 在 MI355X 有 AgentX 榜单案例</td></tr>
+          <tr><td><strong>华为昇腾 950</strong></td><td>Cube + Vector</td><td><strong>v0.1.15 官方后端</strong>（原生代码生成、自动调度与同步、SIMD/SIMT）</td><td>GEMM / FlashAttention 官方示例</td></tr>
+          <tr><td>华为昇腾 910B 等</td><td>Cube</td><td><a href="https://github.com/tile-ai/tilelang-ascend">tilelang-ascend</a>（ascendc_pto / npuir 分支，预览）</td><td>走社区仓库，非主线</td></tr>
+          <tr><td>Apple M4 / M5</td><td>—</td><td>Metal 后端（M5 cooperative tensor GEMM）</td><td>端侧实验</td></tr>
+          <tr><td>CPU / 其他</td><td>—</td><td>LLVM 后端（v0.1.12+）、NVRTC、CuTeDSL、WebGPU</td><td>逻辑调试 / 边缘场景</td></tr>
+        </tbody>
+      </table></div>
+      <blockquote><p>实用结论：<strong>NVIDIA/AMD 主线 pip 装；昇腾 950 用主线（v0.1.15+）、910B 用 tilelang-ascend 仓库；消费级小卡完全可开发，性能目标按算力比折算（15.2 的 70~90% cuBLAS 标准同样适用）。</strong></p></blockquote>
+      <h3>16.1.3 与 vLLM 共存的版本对齐建议</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>vLLM</th><th>tilelang 建议</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td>v0.31.x</td><td>0.1.13 ~ 0.1.15</td><td>vLLM 只做 <code>has_tilelang</code> 探测 + JIT 调用，无强锁版本</td></tr>
+          <tr><td>更旧 (&lt;0.30)</td><td>不建议引入</td><td><code>vllm/tilelang_utils/</code> 体系从 v0.31 起完善</td></tr>
+          <tr><td>vllm-ascend（昇腾）</td><td>与主线对齐 + 昇腾后端</td><td>vllm 与 vllm-ascend 版本必须成对（第 12 章规则不变）</td></tr>
+        </tbody>
+      </table></div>
+
+      <h2><span class="sec-no">16.2</span>编程模型：从 15.1 到工业级</h2>
+      <p>第 15 章讲了"四级内存 + 五类原语"。工业级要再吃透四件事：<strong>线程/warp 组织、布局推导、硬件代际映射、编译器开关</strong>。</p>
+      <h3>16.2.1 一次 kernel 执行的完整映射（脑子里要有这张图）</h3>
+      <div class="code-head"><span>kernel 执行完整映射</span></div>
+      <pre><code>T.Kernel(grid_x, grid_y, threads=N)          # ① CTA 网格: 每 tile 一个 CTA
+  └─ N threads = N/32 warps                  # ② warp 是 TensorCore 指令的发射单位
+       ├─ T.alloc_shared   → 共享内存(smem)   # ③ 搬运缓冲, T.Pipelined 多级化
+       ├─ T.alloc_fragment → 寄存器           # ④ 累加器/中间值, 每线程持有切片
+       │    └─ T.gemm(A_s, B_s, C_f)          # ⑤ 编译器按 warp policy 把 C_f 切给各 warp
+       └─ T.Parallel 循环                     # ⑥ 布局推导入口: 由此向量化/决定数据归属
+</code></pre>
+      <p><strong>GemmWarpPolicy 三种策略</strong>（多 warp 分一个 tile 的矩阵乘时怎么切）：</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>策略</th><th>切法</th><th>适用</th></tr></thead>
+        <tbody>
+          <tr><td><code>FullRow</code></td><td>每个 warp 负责输出的整行块</td><td><strong>默认首选</strong>（FA/MLA 里都是它）</td></tr>
+          <tr><td><code>FullCol</code></td><td>每个 warp 负责整列块</td><td>N 维特别大的 shape</td></tr>
+          <tr><td><code>SquareSplit</code></td><td>行列对半切</td><td>方形 tile、寄存器压力平衡</td></tr>
+        </tbody>
+      </table></div>
+      <h3>16.2.2 布局推导：自动为主，手动为辅</h3>
+      <ul>
+        <li><strong>自动</strong>：<code>T.Parallel</code> 循环是布局推导入口，编译器据此决定向量化宽度、线程数据归属；</li>
+        <li><strong>手动</strong>：<code>T.use_swizzle(panel_size=10)</code> 对 global→smem 地址做交错（防 bank conflict，GEMM 标配）；<code>T.annotate_layout(buffer, layout)</code> 给单个 buffer 指定布局（如官方 GEMM 例里的 <code>make_zn_layout(B_shared)</code>，属于"快到顶了再拧"的最后一档旋钮，初学不用）。</li>
+      </ul>
+      <h3>16.2.3 硬件代际映射：你写的是同一份 Python，编译器选不同指令</h3>
+      <div class="code-head"><span>硬件代际映射</span></div>
+      <pre><code>你的 kernel (T.gemm / T.copy / T.Pipelined)
+   ├─ NVIDIA Ampere  → mma 流水
+   ├─ NVIDIA Hopper  → WGMMA + TMA 异步拷贝 (+ 可选 warp-specialization)
+   ├─ NVIDIA Blackwell → tcgen05 / blockscaled MMA (NVF4)
+   ├─ AMD MI250/300X → Matrix Core (+ AsyncCopy)
+   ├─ 昇腾 950       → Cube 单元 (官方后端自动调度+同步)
+   └─ CPU(LLVM)      → 标量/向量指令 (调试利器: 逻辑错误先在 CPU 复现)
+</code></pre>
+      <p><strong>这就是"一套代码多硬件"的技术根基</strong>，也是第 12/14 章硬件抽象在内核层的延续。</p>
+      <h3>16.2.4 PassConfig：编译器开关的"生产姿态"</h3>
+      <p>vLLM 生产环境（15.5②）的选择及理由，扩展成速查表：</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>PassConfigKey</th><th>含义</th><th>vLLM 生产取值</th><th>你什么时候改</th></tr></thead>
+        <tbody>
+          <tr><td><code>TL_DISABLE_WARP_SPECIALIZED</code></td><td>Hopper warp 专项化调度</td><td><strong>True（关）</strong></td><td>H100/H200 上实验有稳定收益才开</td></tr>
+          <tr><td><code>TL_DISABLE_TMA_LOWER</code></td><td>TMA 张量布局降级</td><td><strong>True（关）</strong></td><td>TMA 路径在你的 shape 上报错/不稳时保持关闭</td></tr>
+          <tr><td><code>TL_PTXAS_REGISTER_USAGE_LEVEL</code></td><td>ptxas 寄存器压力调优级（0~10）</td><td>10（仅 CUDA）</td><td>寄存器溢出(spill)或占用率权衡时扫参</td></tr>
+        </tbody>
+      </table></div>
+      <p>枚举完整清单（版本相关，以装到的为准）：</p>
+      <div class="code-head"><span>枚举 PassConfigKey（bash）</span></div>
+      <pre><code class="language-bash">python -c "import tilelang; print(list(tilelang.PassConfigKey.__members__))"
+</code></pre>
+      <h3>16.2.5 JIT、缓存与调试工具链</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>能力</th><th>用法</th><th>价值</th></tr></thead>
+        <tbody>
+          <tr><td>JIT 装饰器</td><td><code>@tilelang.jit(out_idx=[-1])</code></td><td>尺寸是编译期常量 → 每 shape 一份专属内核，自动缓存</td></tr>
+          <tr><td>导出源码</td><td><code>kernel.get_kernel_source()</code></td><td>检查生成的 CUDA/汇编质量（第 14 章"看编译器底牌"）</td></tr>
+          <tr><td>跨主机二进制缓存</td><td>v0.1.13+（PR #2459）</td><td>编译产物跨兼容主机复用 → <strong>分发 wheel 化的基础</strong>（16.8）</td></tr>
+          <tr><td><code>T.print</code></td><td>打印 buffer/变量</td><td>kernel 内看数值（官方 debug 教程）</td></tr>
+          <tr><td>IR Lower Trace / Pass Visualizer</td><td>v0.1.13 / v0.1.12+</td><td>逐 pass 看编译器怎么改你的 IR（性能玄学变实证）</td></tr>
+          <tr><td>编译期正确性</td><td>Z3 定理证明器接入 Arith（v0.1.6+）</td><td>越界/整除类错误编译期暴露</td></tr>
+          <tr><td>LSP</td><td>tilelang-lsp</td><td>IDE 内联显示 buffer 形状/dtype/layout 推导结果</td></tr>
+        </tbody>
+      </table></div>
+
+      <h2><span class="sec-no">16.3</span>API 速查大全（工业版八类原语）</h2>
+      <p>在第 15 章"五类原语"基础上补全为<strong>八类</strong>，写 kernel 按表索骥：</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>类别</th><th>API</th><th>要点</th></tr></thead>
+        <tbody>
+          <tr><td>声明</td><td><code>T.Tensor((shape), dtype)</code> / <code>T.alloc_shared</code> / <code>T.alloc_fragment</code></td><td>全局/共享/寄存器；fragment 也用于标量组（如每行 m、l）</td></tr>
+          <tr><td>搬运</td><td><code>T.copy(src_view, dst)</code></td><td><strong>从"视图起点"拷"dst 形状"个元素</strong>（支持 stride、dtype 转换）；自动选向量化/异步路径</td></tr>
+          <tr><td>计算</td><td><code>T.gemm(A, B, C, transpose_B=, policy=)</code></td><td>自动 TensorCore；M/N/K ≥ 16；累加器 fp32</td></tr>
+          <tr><td>稀疏/量化 MMA</td><td><code>T.gemm_sp</code>（2:4 稀疏）、<code>T.mma_gemm_blockscaled</code>（Blackwell NVF4）</td><td>量化/稀疏路线</td></tr>
+          <tr><td>逐元素</td><td><code>T.Parallel(i, j)</code> 循环 + <code>T.exp2/T.sqrt/T.max/T.if_then_else</code></td><td>布局推导入口；mask 用有限大负数（见 16.4 陷阱）</td></tr>
+          <tr><td>规约</td><td><code>T.reduce_max/max/sum(src, dst, dim=, clear=True)</code></td><td>按维规约到 fragment；<code>clear=True</code> 覆写而非累加</td></tr>
+          <tr><td>原子/填充</td><td><code>T.atomic_add</code>、<code>T.fill</code>、<code>T.clear</code></td><td>split-K、累加器初始化</td></tr>
+          <tr><td>流程/调试</td><td><code>T.Pipelined(n, num_stages=k)</code>、<code>T.use_swizzle</code>、<code>T.print</code></td><td>动态循环上界可用运行时标量（分页解码的关键，见 16.5）</td></tr>
+        </tbody>
+      </table></div>
+      <p>三个高频细节再强调：</p>
+      <ol>
+        <li><strong><code>T.copy</code> 的视图语义</strong>：<code>T.copy(A[by*block_M, k*block_K], A_shared)</code> 表示"从 A 的 (by*block_M, k*block_K) 起拷一块 block_M×block_K"——所以取 KV 行内切片时改 dst 形状即可（16.5 中 <code>V = cache[..., :512]</code> 就这么实现）。</li>
+        <li><strong>动态循环上界</strong>：<code>T.Pipelined(T.ceildiv(seq_lens[b], BLOCK), ...)</code> 合法（官方 MLA 例同款）——分页解码按真实长度收敛循环的钥匙。</li>
+        <li><strong>fragment 间 <code>T.copy</code></strong> = 带类型转换的元素拷贝（fp32 fragment → fp16 fragment 喂第二个 gemm）。</li>
+      </ol>
+
+      <h2><span class="sec-no">16.4</span>六大工业算子模式地图</h2>
+      <p>写任何 LLM 算子前，先对号入座（判定方法见 14.5）：</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>#</th><th>模式</th><th>判定</th><th>代表算子</th><th>核心原语组合</th><th>成功指标</th><th>本教程实现位置</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td>GEMM 型</td><td>compute-bound</td><td>qkv_proj / o_proj / lm_head</td><td><code>T.gemm</code>+<code>Pipelined</code>+<code>swizzle</code></td><td>TFLOPS ≥ 70% cuBLAS</td><td>15.2 / 官方 <code>examples/gemm</code></td></tr>
+          <tr><td>2</td><td>带宽融合型</td><td>memory-bound</td><td>RMSNorm / RoPE / QK-Norm / act</td><td><code>T.Parallel</code> 向量化 + <code>reduce</code></td><td>有效带宽 ≥ 70% 理论值</td><td>15.3、<strong>16.6.2</strong></td></tr>
+          <tr><td>3</td><td>Online-softmax 注意力</td><td>混合</td><td>FA prefill/decode</td><td>双 <code>T.gemm</code> + <code>exp2</code> + <code>reduce</code></td><td>与 SDPA 数值一致</td><td>15.4、<strong>16.6.1</strong></td></tr>
+          <tr><td>4</td><td>Paged-KV 解码</td><td>混合</td><td>GQA/MLA decode</td><td><code>block_table</code> + 动态循环</td><td>TPOT 延迟</td><td><strong>16.5.2</strong></td></tr>
+          <tr><td>5</td><td>分组 GEMM</td><td>MoE</td><td>gate_up / down</td><td><code>expert_ids</code> 按块选权</td><td>端到端吞吐</td><td><strong>16.6.3</strong></td></tr>
+          <tr><td>6</td><td>Dequant 融合</td><td>量化</td><td>W4A16 / FP8-block GEMM</td><td>位运算反量化 + <code>T.gemm</code></td><td>带宽/TFLOPS</td><td><strong>16.6.4</strong></td></tr>
+        </tbody>
+      </table></div>
+      <p><strong>一个贯穿全章的工程陷阱先立此存照</strong>：在线 softmax 的掩码不要用 <code>-inf</code>。全掩码行会出现 <code>-inf - (-inf) = NaN</code>，并沿 <code>exp2</code> 传播污染输出。工业做法是用<strong>有限大负数哨兵</strong>（如 <code>-1e6</code>），配合"越界行不写回"——下面所有 kernel 都这么写。</p>
+
+      <h2><span class="sec-no">16.5</span>DeepSeek 适配实战：MLA / MoE / FP8</h2>
+      <h3>16.5.1 DeepSeek-V3 系结构与内核挑战速览（衔接第 11 章）</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>组件</th><th>结构参数（V3/V3.2）</th><th>内核挑战</th><th>本章方案</th></tr></thead>
+        <tbody>
+          <tr><td>注意力</td><td><strong>MLA</strong>：128 头；<code>kv_lora_rank=512</code>；<code>qk_rope_head_dim=64</code>；KV cache <strong>576/ token</strong></td><td>吸收后 decode 变"多行共享单 KV"的 GEMV-like</td><td>16.5.2</td></tr>
+          <tr><td>FFN</td><td><strong>MoE</strong>：256 专家激活 8；FP8 128×128 块缩放</td><td>分组 GEMM + 细粒度反量化</td><td>16.6.3 模式 + 块缩放扩展</td></tr>
+          <tr><td>MTP</td><td>多 token 预测（投机解码）</td><td>系统层</td><td>第 08/11 章（vLLM 特性层解决，无需新 kernel）</td></tr>
+        </tbody>
+      </table></div>
+      <p><strong>MLA 吸收的数学</strong>（为什么 KV cache 只要 576 维）：</p>
+      <div class="code-head"><span>MLA 吸收的数学</span></div>
+      <pre><code>标准注意力:  softmax(q·K^T/√d)·V
+MLA:        k_c = W_UK·c , q_nope·k_c = q_nope·(W_UK·c) = (W_UK^T·q_nope)·c
+            → 令 q_latent = W_UK^T·q_nope (512 维), 则
+            Q' = [q_latent | q_pe] (512+64 = 576)
+            K' = [c       | k_pe]  (512+64 = 576)   ← 这就是 cache 的 576!
+            V  = c (512)                            ← v_c = W_UV·c 被吸收, 输出再乘 W_UV
+softmax scale 用未吸收的 qk 维度: 1/√(128+64) = 1/√192
+</code></pre>
+      <p>vLLM 的 MLA cache 布局即 <code>(num_blocks, block_size, 576)</code>，前 512 维既是 K 的主体也是 V。</p>
+      <h3>16.5.2 完整实现：MLA Paged Decode kernel（工业参考版）</h3>
+      <p>设计要点（每一条都对应官方 FlashMLA / tilelang <code>examples/deepseek_mla</code> 的一个手法）：</p>
+      <ol>
+        <li><strong>head-as-row</strong>：128 个 Q 头共享同一份 KV → 把"头"当 M 维行（block_H=64 头/CTA），M=64 足够 TensorCore 吃满，且 KV 只需加载一次服务 64 行；</li>
+        <li><strong>分页 + 动态循环</strong>：外层按 <code>block_table</code> 逐页取 KV，循环上界用<strong>运行时</strong> <code>seq_lens[b]</code>；</li>
+        <li><strong>V 复用 cache 前缀</strong>：<code>T.copy(cache[page,0,0], V_s)</code> 拷 (16,512) 即取前 512 维；</li>
+        <li>有限哨兵掩码；<code>T.exp2</code> 预乘 log2(e)；fp32 累加。</li>
+      </ol>
+      <blockquote><p>注：教学版按"每迭代处理一个 16-token 页"展开（block_N=BLOCK_SIZE=16），逻辑最清晰。生产内核会一次拷多页拼成 64~128 的块再算（减少迭代、加深流水）——读者优化练习（16.11 实验 16-1）。</p></blockquote>
+      <div class="code-head"><span>mla_paged_decode.py · MLA Paged Decode kernel</span></div>
+      <pre><code class="language-python">import tilelang
+import tilelang.language as T
+
+@tilelang.jit(out_idx=[-1])
+def mla_paged_decode(
+    B: int,                    # 并发请求数(调度器给出)
+    num_blocks: int,           # KV cache 总页数
+    H: int = 128,              # 头数
+    D_LAT: int = 512,          # kv_lora_rank
+    D_ROPE: int = 64,          # rope 维度
+    BLOCK_SIZE: int = 16,      # vLLM 分页大小
+    MAX_PAGES: int = 4096,     # block_table 行宽
+    block_H: int = 64,         # 每 CTA 的头数(=M 维行数)
+    num_stages: int = 2, threads: int = 256,
+    dtype: str = "bfloat16", accum_dtype: str = "float",
+):
+    D_Q = D_LAT + D_ROPE                                # 576
+    scale = (1.0 / 192) ** 0.5 * 1.44269504             # 1/√192 × log2(e)
+
+    @T.prim_func
+    def main(
+        Q:         T.Tensor((B, H, D_Q), dtype),        # 吸收后的 Q: [q_latent|q_pe]
+        KV_cache:  T.Tensor((num_blocks, BLOCK_SIZE, D_Q), dtype),  # [c(512)|k_pe(64)]
+        block_table: T.Tensor((B, MAX_PAGES), "int32"),
+        seq_lens:  T.Tensor((B,), "int32"),
+        O:         T.Tensor((B, H, D_LAT), dtype),      # 输出(512), 后续模型代码再乘 W_UV
+    ):
+        with T.Kernel(T.ceildiv(H, block_H), B, threads=threads) as (hb, b):
+            Q_s   = T.alloc_shared((block_H, D_Q), dtype)
+            K_s   = T.alloc_shared((BLOCK_SIZE, D_Q), dtype)
+            V_s   = T.alloc_shared((BLOCK_SIZE, D_LAT), dtype)
+            acc_s = T.alloc_fragment((block_H, BLOCK_SIZE), accum_dtype)
+            acc_p = T.alloc_fragment((block_H, BLOCK_SIZE), dtype)   # cast 后喂第二个 gemm
+            acc_o = T.alloc_fragment((block_H, D_LAT), accum_dtype)
+            m_prev = T.alloc_fragment((block_H,), accum_dtype)
+            m_new  = T.alloc_fragment((block_H,), accum_dtype)
+            alpha  = T.alloc_fragment((block_H,), accum_dtype)
+            l_prev = T.alloc_fragment((block_H,), accum_dtype)
+            l_new  = T.alloc_fragment((block_H,), accum_dtype)
+
+            kv_len = seq_lens[b]                        # 运行时标量
+            T.copy(Q[b, hb * block_H, 0], Q_s)          # 连续 64 个头 × 576 维
+            T.fill(m_prev, -1e6)                        # 有限哨兵(非 -inf!)
+            T.fill(l_prev, 0)
+            T.clear(acc_o)
+
+            # ★ 动态循环上界: 只处理真实长度, 不存在的页绝不访存
+            for nb in T.Pipelined(T.ceildiv(kv_len, BLOCK_SIZE), num_stages=num_stages):
+                page = block_table[b, nb]
+                T.copy(KV_cache[page, 0, 0], K_s)       # (16, 576) 完整行
+                T.copy(KV_cache[page, 0, 0], V_s)       # (16, 512) 同起点取前 512 = V=c
+                T.clear(acc_s)
+                T.gemm(Q_s, K_s, acc_s, transpose_B=True,
+                       policy=T.GemmWarpPolicy.FullRow)
+                for i, j in T.Parallel(block_H, BLOCK_SIZE):
+                    acc_s[i, j] = T.if_then_else(
+                        nb * BLOCK_SIZE + j &lt; kv_len,   # 页内尾部掩码
+                        acc_s[i, j] * scale, -1e6)
+                # ---- 在线 softmax(同 15.4 手法) ----
+                T.reduce_max(acc_s, m_new, dim=1, clear=True)
+                for i in T.Parallel(block_H):
+                    m_new[i] = T.max(m_prev[i], m_new[i])
+                    alpha[i] = T.exp2(m_prev[i] - m_new[i])
+                for i, d in T.Parallel(block_H, D_LAT):
+                    acc_o[i, d] = acc_o[i, d] * alpha[i]
+                for i, j in T.Parallel(block_H, BLOCK_SIZE):
+                    acc_s[i, j] = T.exp2(acc_s[i, j] - m_new[i])
+                T.reduce_sum(acc_s, l_new, dim=1, clear=True)
+                for i in T.Parallel(block_H):
+                    l_prev[i] = l_prev[i] * alpha[i] + l_new[i]
+                T.copy(acc_s, acc_p)                    # fp32 → bf16
+                T.gemm(acc_p, V_s, acc_o, policy=T.GemmWarpPolicy.FullRow)
+                T.copy(m_new, m_prev)
+
+            for i, d in T.Parallel(block_H, D_LAT):
+                acc_o[i, d] = acc_o[i, d] / l_prev[i]
+            T.copy(acc_o, O[b, hb * block_H, 0])
+    return main
+</code></pre>
+      <p><strong>对拍基准</strong>：无分页小长度场景可与 <code>torch SDPA</code>（把 576 当 head_dim）对拍；生产等价物是 <a href="https://github.com/deepseek-ai/FlashMLA">FlashMLA</a>。官方战绩参考：tilelang 的 MLA decode <strong>80 行打平 H100 上的 FlashMLA</strong>（2025-03）；AMD MI300X 版本<strong>打平 Aiter 汇编内核</strong>（2025-04）——这是"TileLang 工业可用"的最硬证据。</p>
+      <h3>16.5.3 集成点与回退关系（接 14.2 内核选择链路）</h3>
+      <div class="code-head"><span>集成点与回退关系</span></div>
+      <pre><code>vLLM DeepSeek 注意力入口
+   ├─ NVIDIA + has_deep_gemm + FlashMLA 可用 → 官方专属内核(①层, 首选)
+   ├─ 昇腾/其他硬件 或 需要定制变体 → 本章 TileLang MLA kernel(②层)
+   │      └─ 注册为 custom op(16.8) + warmup 固定 shape(16.8③)
+   └─ 都不可用 → FlashInfer/Triton 后端(③层) → SDPA(④层)
+</code></pre>
+      <p><strong>FP8 块缩放 GEMM</strong>（DeepSeek FFN 的 128×128 块缩放）属于模式 6 的 W8A8 变体：在 16.6.4 的 dequant kernel 里把"4bit→fp16"换成"fp8→fp16 + 按 128×128 块取 scale"即可，结构完全不变。NVIDIA 上 vLLM 会优先 DeepGEMM（15.5⑥ 的双实现回退同款逻辑）。</p>
+
+      <h2><span class="sec-no">16.6</span>GLM / Qwen 适配实战：GQA / 融合核 / MoE / W4A16</h2>
+      <h3>16.6.0 结构对照与内核机会</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>模型</th><th>注意力</th><th>特有结构</th><th>TileLang 内核机会</th></tr></thead>
+        <tbody>
+          <tr><td>Qwen2.5</td><td>GQA（head_dim=128，KV 头 2~8）</td><td>—</td><td>varlen prefill（16.6.1）</td></tr>
+          <tr><td>Qwen3</td><td>GQA + <strong>QK-Norm</strong>（q/k 逐头 RMSNorm 再 RoPE）</td><td>Qwen3-MoE：128 家激活 8</td><td>★QK-Norm+RoPE 融合（16.6.2）；MoE（16.6.3）</td></tr>
+          <tr><td>GLM-4 / GLM-4.5</td><td>GQA</td><td><strong>partial RoPE</strong>（部分维度旋转）；GLM-4.5：MoE 160/8、MTP</td><td>partial RoPE 改造（16.6.2 注）；MoE（16.6.3）</td></tr>
+          <tr><td>消费卡量化部署</td><td>—</td><td>AWQ/GPTQ W4A16</td><td>dequant GEMM（16.6.4）</td></tr>
+        </tbody>
+      </table></div>
+      <p><strong>诚实的工程建议（decode 路线）</strong>：Qwen/GLM 的 GQA group = H/H_KV 只有 2~8，"head-as-row" 的 M 维太小，TensorCore 吃不满——<strong>decode 注意力直接用 vLLM 内置的 FlashAttention/FlashInfer 后端更优</strong>。TileLang 在这些模型上的价值在<strong>prefill 变长注意力、逐元素融合、MoE 分组 GEMM、量化 GEMM</strong>。给模型选 kernel 要扬长避短。</p>
+      <h3>16.6.1 完整实现：varlen GQA Prefill kernel（Qwen/GLM 通用）</h3>
+      <p>变长打包（batch 内所有序列首尾相接存成 <code>(Q_total, H, DK)</code>）+ <code>cu_seqlens</code> 偏移 + 因果掩码（含前缀：query 对应 kv 序列的<strong>末尾</strong> q_len 段）。</p>
+      <div class="code-head"><span>gqa_varlen_prefill.py · varlen GQA Prefill kernel</span></div>
+      <pre><code class="language-python">@tilelang.jit(out_idx=[-1])
+def gqa_varlen_prefill(
+    Q_total: int, K_total: int,          # 打包总 token 数(编译期常量)
+    H: int, H_KV: int, DK: int, DV: int,
+    B: int,                              # 序列数
+    MAX_Q: int,                          # 最长 query(决定网格)
+    block_M: int = 64, block_N: int = 64,
+    num_stages: int = 2, threads: int = 256,
+    dtype: str = "bfloat16", accum_dtype: str = "float",
+):
+    group = H // H_KV
+    scale = (1.0 / DK) ** 0.5 * 1.44269504
+
+    @T.prim_func
+    def main(
+        Q: T.Tensor((Q_total, H, DK), dtype),
+        K: T.Tensor((K_total, H_KV, DK), dtype),
+        V: T.Tensor((K_total, H_KV, DV), dtype),
+        cu_q: T.Tensor((B + 1,), "int32"),   # 每 batch 的 q 起止
+        cu_k: T.Tensor((B + 1,), "int32"),   # 每 batch 的 kv 起止
+        O: T.Tensor((Q_total, H, DV), dtype),
+    ):
+        with T.Kernel(H, T.ceildiv(MAX_Q, block_M), B, threads=threads) as (h, mb, b):
+            Q_s   = T.alloc_shared((block_M, DK), dtype)
+            K_s   = T.alloc_shared((block_N, DK), dtype)
+            V_s   = T.alloc_shared((block_N, DV), dtype)
+            acc_s = T.alloc_fragment((block_M, block_N), accum_dtype)
+            acc_p = T.alloc_fragment((block_M, block_N), dtype)
+            acc_o = T.alloc_fragment((block_M, DV), accum_dtype)
+            m_prev = T.alloc_fragment((block_M,), accum_dtype)
+            m_new  = T.alloc_fragment((block_M,), accum_dtype)
+            alpha  = T.alloc_fragment((block_M,), accum_dtype)
+            l_prev = T.alloc_fragment((block_M,), accum_dtype)
+            l_new  = T.alloc_fragment((block_M,), accum_dtype)
+
+            q_start = cu_q[b]
+            q_len   = cu_q[b + 1] - q_start
+            k_start = cu_k[b]
+            kv_len  = cu_k[b + 1] - k_start
+            kv_head = h // group                    # GQA: 多个 Q 头映射同一 KV 头
+
+            # Q 块带掩码装入(块尾越界行填 0; 这些行永不写回)
+            for i, d in T.Parallel(block_M, DK):
+                Q_s[i, d] = T.if_then_else(mb * block_M + i &lt; q_len,
+                                           Q[q_start + mb * block_M + i, h, d], 0)
+            T.fill(m_prev, -1e6)
+            T.fill(l_prev, 0)
+            T.clear(acc_o)
+
+            for nb in T.Pipelined(T.ceildiv(kv_len, block_N), num_stages=num_stages):
+                for i, d in T.Parallel(block_N, DK):          # K 块带掩码装入
+                    K_s[i, d] = T.if_then_else(nb * block_N + i &lt; kv_len,
+                        K[k_start + nb * block_N + i, kv_head, d], 0)
+                for i, d in T.Parallel(block_N, DV):
+                    V_s[i, d] = T.if_then_else(nb * block_N + i &lt; kv_len,
+                        V[k_start + nb * block_N + i, kv_head, d], 0)
+                T.clear(acc_s)
+                T.gemm(Q_s, K_s, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                # 因果掩码(含前缀偏移): in-range 行 q_pos &lt; kv_len, 故单条件即够
+                for i, j in T.Parallel(block_M, block_N):
+                    q_pos = (kv_len - q_len) + mb * block_M + i
+                    acc_s[i, j] = T.if_then_else(nb * block_N + j &lt;= q_pos,
+                                                 acc_s[i, j] * scale, -1e6)
+                # ---- 在线 softmax ----
+                T.reduce_max(acc_s, m_new, dim=1, clear=True)
+                for i in T.Parallel(block_M):
+                    m_new[i] = T.max(m_prev[i], m_new[i])
+                    alpha[i] = T.exp2(m_prev[i] - m_new[i])
+                for i, d in T.Parallel(block_M, DV):
+                    acc_o[i, d] = acc_o[i, d] * alpha[i]
+                for i, j in T.Parallel(block_M, block_N):
+                    acc_s[i, j] = T.exp2(acc_s[i, j] - m_new[i])
+                T.reduce_sum(acc_s, l_new, dim=1, clear=True)
+                for i in T.Parallel(block_M):
+                    l_prev[i] = l_prev[i] * alpha[i] + l_new[i]
+                T.copy(acc_s, acc_p)
+                T.gemm(acc_p, V_s, acc_o, policy=T.GemmWarpPolicy.FullRow)
+                T.copy(m_new, m_prev)
+
+            for i, d in T.Parallel(block_M, DV):
+                acc_o[i, d] = acc_o[i, d] / l_prev[i]
+                if mb * block_M + i &lt; q_len:              # 带谓词写回, 不越序列界
+                    O[q_start + mb * block_M + i, h, d] = acc_o[i, d]
+    return main
+</code></pre>
+      <blockquote><p>注意 <code>Q_total/K_total/B/MAX_Q</code> 都是编译期常量 → 每个 batch 形状组合都会编译一份内核。这正是 16.8 warmup 体系存在的原因（vLLM 的 CUDA Graph capture 尺寸表就是 warmup 清单）。</p></blockquote>
+      <h3>16.6.2 完整实现：QK-Norm + RoPE 融合 kernel（Qwen3 同款，GLM partial RoPE 一行改）</h3>
+      <p>Qwen3 在 RoPE 前对 q/k 做<strong>逐头 RMSNorm</strong>——两次逐元素访存变一次，带宽型融合的标准机会。kernel 按 token 切 CTA，一次处理该 token 的全部 Q 头与 K 头，就地写回（与 vLLM 的 in-place rotary 语义一致）。</p>
+      <div class="code-head"><span>fused_qk_norm_rope.py · QK-Norm + RoPE 融合 kernel</span></div>
+      <pre><code class="language-python">@tilelang.jit
+def fused_qk_norm_rope(
+    T_tok: int, H: int, H_KV: int, DK: int, MAX_POS: int,
+    eps: float = 1e-6, threads: int = 128, dtype: str = "bfloat16",
+):
+    HALF = DK // 2
+
+    @T.prim_func
+    def main(
+        Q: T.Tensor((T_tok, H, DK), dtype),          # 就地修改
+        K: T.Tensor((T_tok, H_KV, DK), dtype),
+        qw: T.Tensor((DK,), dtype),                  # q-norm 逐通道权重
+        kw: T.Tensor((DK,), dtype),                  # k-norm 逐通道权重
+        cos_cache: T.Tensor((MAX_POS, HALF), "float"),   # 预计算 rope 表
+        sin_cache: T.Tensor((MAX_POS, HALF), "float"),
+        positions: T.Tensor((T_tok,), "int32"),
+    ):
+        with T.Kernel(T_tok, threads=threads) as (t):
+            q_f  = T.alloc_fragment((H, DK), "float")
+            k_f  = T.alloc_fragment((H_KV, DK), "float")
+            tmp  = T.alloc_fragment((H, DK), "float")      # 平方暂存(不破坏原值)
+            tmpk = T.alloc_fragment((H_KV, DK), "float")
+            sq   = T.alloc_fragment((H,), "float")
+            sk   = T.alloc_fragment((H_KV,), "float")
+            invq = T.alloc_fragment((H,), "float")
+            invk = T.alloc_fragment((H_KV,), "float")
+
+            pos = positions[t]
+            T.copy(Q[t, 0, 0], q_f)          # shared↔fragment copy 兼做 fp32 转换
+            T.copy(K[t, 0, 0], k_f)
+
+            # ---- Q: 逐头 RMSNorm ----
+            for h, d in T.Parallel(H, DK):
+                tmp[h, d] = q_f[h, d] * q_f[h, d]
+            T.reduce_sum(tmp, sq, dim=1, clear=True)
+            for h in T.Parallel(H):
+                invq[h] = 1.0 / T.sqrt(sq[h] / DK + eps)
+            for h, d in T.Parallel(H, DK):
+                q_f[h, d] = q_f[h, d] * invq[h] * qw[d]
+            # ---- Q: RoPE(NEOX 对半拆分) ----
+            for h, d in T.Parallel(H, HALF):
+                c = cos_cache[pos, d]; s = sin_cache[pos, d]
+                x1 = q_f[h, d]; x2 = q_f[h, d + HALF]
+                q_f[h, d]        = x1 * c - x2 * s
+                q_f[h, d + HALF] = x2 * c + x1 * s
+            T.copy(q_f, Q[t, 0, 0])          # 写回(隐式 fp32→bf16)
+
+            # ---- K: 同上(H_KV 行) ----
+            for h, d in T.Parallel(H_KV, DK):
+                tmpk[h, d] = k_f[h, d] * k_f[h, d]
+            T.reduce_sum(tmpk, sk, dim=1, clear=True)
+            for h in T.Parallel(H_KV):
+                invk[h] = 1.0 / T.sqrt(sk[h] / DK + eps)
+            for h, d in T.Parallel(H_KV, DK):
+                k_f[h, d] = k_f[h, d] * invk[h] * kw[d]
+            for h, d in T.Parallel(H_KV, HALF):
+                c = cos_cache[pos, d]; s = sin_cache[pos, d]
+                x1 = k_f[h, d]; x2 = k_f[h, d + HALF]
+                k_f[h, d]        = x1 * c - x2 * s
+                k_f[h, d + HALF] = x2 * c + x1 * s
+            T.copy(k_f, K[t, 0, 0])
+    return main
+</code></pre>
+      <blockquote><p><strong>复用提示</strong>：Q/K 两段是复制粘贴级同构，落地时可抽成 <code>norm_rope(frag, weight)</code> 辅助函数；TileLang 的 <code>T.alloc_*</code> 在工厂闭包内声明、<code>T.Parallel</code> 循环可参数化，重构零成本。</p></blockquote>
+      <p><strong>GLM partial RoPE 改法</strong>：GLM 系只有前 <code>rotary_dim</code> 个通道参与旋转（且部分版本用 GPT-J 相邻配对 <code>(2i, 2i+1)</code> 而非 NEOX 对半）。改法就是把 RoPE 循环限幅并用 <code>T.if_then_else</code> 让 <code>d &gt;= rotary_dim/2</code> 的通道保持原值，配对方式按模型 config 对应实现。</p>
+      <p><strong>成功指标</strong>：融合前 RMSNorm、RoPE 两次读写，融合后一次；有效带宽对照 15.3 的 GB/s 标准。</p>
+      <h3>16.6.3 完整实现：MoE 分组 GEMM（Qwen3-MoE / GLM-4.5 / DeepSeek 通用）</h3>
+      <p>前置（vLLM <code>moe_align_block_size</code> 已做）：把 token 按专家<strong>排序</strong>并把总行数 pad 到 <code>block_M</code> 整数倍，产出一个"每行块 → 专家"的映射表。kernel 与普通 GEMM 的唯一区别：<strong>权重按行块查表选择</strong>——却因此把 256 次（DeepSeek）小 GEMM 合成了一次大网格。</p>
+      <div class="code-head"><span>moe_grouped_gemm.py · MoE 分组 GEMM</span></div>
+      <pre><code class="language-python">@tilelang.jit(out_idx=[-1])
+def moe_grouped_gemm(
+    M_pad: int, N: int, K: int, E: int,   # M_pad = pad 后的排序 token 行数
+    block_M: int = 64, block_N: int = 128, block_K: int = 64,
+    num_stages: int = 3, threads: int = 128,
+    dtype: str = "bfloat16", accum_dtype: str = "float",
+):
+    @T.prim_func
+    def main(
+        X_sorted:   T.Tensor((M_pad, K), dtype),
+        W:          T.Tensor((E, N, K), dtype),              # 每专家权重
+        expert_ids: T.Tensor((M_pad // block_M,), "int32"),  # 每行块 → 专家
+        O:          T.Tensor((M_pad, N), dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M_pad, block_M),
+                      threads=threads) as (bx, bm):
+            A_shared = T.alloc_shared((block_M, block_K), dtype)
+            B_shared = T.alloc_shared((block_N, block_K), dtype)
+            C_local  = T.alloc_fragment((block_M, block_N), accum_dtype)
+            e = expert_ids[bm]                    # ★ 与普通 GEMM 的唯一差异
+            T.clear(C_local)
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
+                T.copy(X_sorted[bm * block_M, k * block_K], A_shared)
+                T.copy(W[e, bx * block_N, k * block_K], B_shared)
+                T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+            T.copy(C_local, O[bm * block_M, bx * block_N])
+    return main
+</code></pre>
+      <p>生产扩展（按 16.4 模式 1→6 组合）：</p>
+      <ul>
+        <li><strong>gate_up 融合激活</strong>：<code>N</code> 维即 <code>2*moe_intermediate</code>，在写回前对两半做 SiLU×mul（模式 2 手法）；</li>
+        <li><strong>三段合一</strong>：gate_up GEMM + act + down GEMM 融合进一个 kernel（中间结果留 fragment/shared，省两次全局往返）——vLLM <code>fused_moe</code> 的 TileLang 化路线；</li>
+        <li><strong>FP8 块缩放</strong>：16.5.3 的说明同样适用（DeepSeek/Qwen3-FP8 权重）。</li>
+      </ul>
+      <h3>16.6.4 完整实现：W4A16 dequant GEMM（AWQ/GPTQ 量化模型跑消费卡）</h3>
+      <p>把"反量化 + GEMM"融进一个 kernel：权重以 4bit 打包驻留显存，块内解包升精度后直接 TensorCore。</p>
+      <div class="code-head"><span>w4a16_gemm.py · W4A16 dequant GEMM</span></div>
+      <pre><code class="language-python">@tilelang.jit(out_idx=[-1])
+def w4a16_gemm(
+    M: int, N: int, K: int,
+    group_size: int = 128,               # 教学版约束: block_K == group_size
+    block_M: int = 64, block_N: int = 64,
+    num_stages: int = 2, threads: int = 128,
+    dtype: str = "float16", accum_dtype: str = "float",
+):
+    @T.prim_func
+    def main(
+        A:     T.Tensor((M, K), dtype),
+        B_q:   T.Tensor((N, K // 8), "int32"),                  # 4bit×8 打包
+        scales:T.Tensor((N, K // group_size), dtype),
+        O:     T.Tensor((M, N), dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M),
+                      threads=threads) as (bx, by):
+            A_shared  = T.alloc_shared((block_M, group_size), dtype)
+            Bq_shared = T.alloc_shared((block_N, group_size // 8), "int32")
+            B_deq     = T.alloc_shared((group_size, block_N), dtype)  # 解包后的 B tile
+            sc_shared = T.alloc_shared((block_N,), dtype)
+            C_local   = T.alloc_fragment((block_M, block_N), accum_dtype)
+            T.clear(C_local)
+            for kb in T.Pipelined(T.ceildiv(K, group_size), num_stages=num_stages):
+                T.copy(A[by * block_M, kb * group_size], A_shared)
+                T.copy(B_q[bx * block_N, kb * (group_size // 8)], Bq_shared)
+                T.copy(scales[bx * block_N, kb], sc_shared)
+                # ★ 逐元素解包: int32 里每 4bit 一个权重, 对称量化零点=8
+                for kk, nn in T.Parallel(group_size, block_N):
+                    w4 = (Bq_shared[nn, kk &gt;&gt; 3] &gt;&gt; ((kk &amp; 7) &lt;&lt; 2)) &amp; 0xF
+                    B_deq[kk, nn] = (w4 - 8) * sc_shared[nn]   # int→float 自动升 fp32, 存回隐式转换
+                T.gemm(A_shared, B_deq, C_local)
+            T.copy(C_local, O[by * block_M, bx * block_N])
+    return main
+</code></pre>
+      <ul>
+        <li>AWQ 的 asymmetric 变体还要减 zero-point（打包在权重的另一 4bit 字段），官方 <code>examples/dequantize_gemm</code> 有完整处理；group_size ≠ block_K 的通用情形按块内分段处理。</li>
+        <li>官方 <a href="https://github.com/tile-ai/TileOPs">TileOPs</a> 已有 W4A16 长 K 流式版本，<strong>先抄再用</strong>。</li>
+      </ul>
+
+      <h2><span class="sec-no">16.7</span>跨硬件适配体系：同一份 kernel 源码跑 NVIDIA / AMD / 昇腾</h2>
+      <h3>16.7.1 总架构：回退链 + 平台门卫（全系列 12/14/15 章的原则收敛）</h3>
+      <div class="code-head"><span>回退链总架构</span></div>
+      <pre><code>调用点(attention / mlp / norm)
+   │ ① 专属极致: DeepGEMM / FlashMLA / Aiter / DeepSeek 官方内核族     ← 硬件绑定的 C++/汇编
+   │    条件: has_deep_gemm() / 平台白名单 / shape 命中
+   ├─ ② 通用优化: 你的 TileLang kernel                                 ← 一份源码, 多硬件
+   │    条件: has_tilelang() and 平台受支持(16.1.2 矩阵)
+   ├─ ③ 兜底: Triton / FlashInfer / vLLM 内置后端
+   └─ ④ 最后回退: torch 原生(SDPA / matmul)
+</code></pre>
+      <p>平台门卫 + 延迟导入的教科书写法（14.3 四条军规的内核版）：</p>
+      <div class="code-head"><span>my_ops/__init__.py</span></div>
+      <pre><code class="language-python"># my_ops/__init__.py
+from vllm.platforms import current_platform
+from vllm.utils.import_utils import has_tilelang
+
+_TILELANG_ENABLED = has_tilelang() and (
+    current_platform.is_cuda() or current_platform.is_rocm())
+
+if _TILELANG_ENABLED:
+    import tilelang                      # ← 只在门卫通过后才 import(第13/14章军规)
+    import tilelang.language as T
+</code></pre>
+      <h3>16.7.2 PassConfig 按硬件切换</h3>
+      <div class="code-head"><span>PassConfig 按硬件切换</span></div>
+      <pre><code class="language-python">def get_platform_pass_configs() -&gt; dict:
+    """激进优化 ≠ 万金油: 按目标硬件裁剪编译器(与 vLLM 15.5② 同构)"""
+    import tilelang
+    cfg = {
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+    }
+    if current_platform.is_cuda():
+        cfg[tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL] = 10
+    elif current_platform.is_rocm():
+        pass   # MI300X: AsyncCopy 路径由编译器自动选择, 无需额外开关
+    return cfg
+
+# 注入方式: 工厂函数 JIT 时传入
+kernel = tilelang.jit(out_idx=[-1], pass_configs=get_platform_pass_configs())(_factory)(args...)
+</code></pre>
+      <h3>16.7.3 昇腾 NPU 路线（两条，按芯片代际选）</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>路线</th><th>芯片</th><th>做法</th></tr></thead>
+        <tbody>
+          <tr><td><strong>主线官方后端</strong>（推荐起点）</td><td>昇腾 950</td><td>TileLang <strong>v0.1.15+</strong> 内置：原生代码生成、自动调度与同步、SIMD/SIMT 向量编程；官方提供 GEMM / FlashAttention 示例。kernel 源码与 NVIDIA 版<strong>基本一致</strong>，差异交给编译器</td></tr>
+          <tr><td>社区仓库</td><td>910B 等</td><td><a href="https://github.com/tile-ai/tilelang-ascend">tilelang-ascend</a>：<code>ascendc_pto</code>（AscendC 路线）/ <code>npuir</code>（NPU IR 路线）两分支，预览级</td></tr>
+        </tbody>
+      </table></div>
+      <p>昇腾上的工程注意：</p>
+      <ol>
+        <li>与 <strong>vllm-ascend</strong> 协同时（第 12 章⑤），平台判定以 vllm-ascend 注册的 Platform 为准，门卫写成 <code>getattr(current_platform, "device_type", None) == "npu"</code> 风格的防御式检查；</li>
+        <li>优先跑官方示例验证工具链（GEMM/FA），再上自研 kernel；Cube 单元的 tile 尺寸约束与 NVIDIA 不同，<code>block_M/N/K</code> 扫参表要按 NPU 重扫（16.9 sweep 脚本直接复用）；</li>
+        <li>昇腾暂无 DeepGEMM 等专属层 → <strong>TileLang 在这里的地位从"②层"升为"首选优化层"</strong>，这正是跨硬件策略的价值：同一份工程，缺谁补谁。</li>
+      </ol>
+      <h3>16.7.4 AMD 与 Apple</h3>
+      <ul>
+        <li>AMD：MI250/MI300X 主线支持（MatrixCore/AsyncCopy 自动映射）；MLA 在 MI300X 打平 Aiter（16.5.2）；ROCm 下 PassConfig 无需 TMA/warp-spec 项（本来就不走）；</li>
+        <li>Apple：Metal 后端可用作端侧原型，M5 起有 cooperative tensor GEMM；生产推理不在主战场。</li>
+      </ul>
+      <h3>16.7.5 CI 测试矩阵（工业必备）</h3>
+      <div class="code-head"><span>CI 测试矩阵</span></div>
+      <pre><code>shape 轴:  decode(B∈{1,8,64}; S∈{1K,32K}) × prefill(T∈{512,4K,32K})
+dtype 轴:  fp16 / bf16 / fp8-block / w4a16
+硬件轴:    A100 / H100 / 4090 / MI300X / 昇腾950(或910B)
+每格:      数值对拍(16.9.3) + 延迟 + 带宽/TFLOPS  → 一张 CSV 报告
+</code></pre>
+
+      <h2><span class="sec-no">16.8</span>vLLM 生产集成手册（六件事的完整代码）</h2>
+      <p>15.5 列了六件事的"是什么"，这里给"怎么写"。目标结构（作为 vLLM 插件包，入口点注册见第 13 章）：</p>
+      <div class="code-head"><span>插件包目录结构</span></div>
+      <pre><code>my_vllm_tilelang_ops/
+├── pyproject.toml                 # vllm.general_plugins 入口(第13章)
+└── my_vllm_tilelang_ops/
+    ├── __init__.py                # 平台门卫 + register()
+    ├── kernels.py                 # kernel 工厂 + Deferred 缓存
+    ├── ops.py                     # custom op 注册(①)
+    ├── backend.py                 # (可选)注意力后端级集成, 见 ⑧
+    └── warmup.py                  # 启动期编译预热(③)
+</code></pre>
+      <h3>① custom op 注册（torch.compile / CUDA Graph 的通行证）</h3>
+      <div class="code-head"><span>ops.py · custom op 注册</span></div>
+      <pre><code class="language-python"># ops.py
+import torch
+from vllm.utils.torch_utils import direct_register_custom_op
+from .kernels import get_rmsnorm_kernel, TILELANG_ENABLED
+
+def _tilelang_rmsnorm_impl(input: torch.Tensor, weight: torch.Tensor,
+                           out: torch.Tensor) -&gt; None:
+    kernel = get_rmsnorm_kernel(input.shape[0], input.shape[1], input.dtype)
+    kernel(input, weight, out)          # 生产版: 输出作 prim_func 参数直接写入(零拷贝)
+
+_OP_REGISTERED = False
+
+def register_tilelang_ops() -&gt; bool:
+    global _OP_REGISTERED
+    if _OP_REGISTERED or not TILELANG_ENABLED:
+        return False
+    direct_register_custom_op(
+        op_name="tilelang_rmsnorm",
+        op_func=_tilelang_rmsnorm_impl,
+        mutates_args=["out"],           # 声明就地修改 → 图内合法, 不打断 CUDA Graph
+    )
+    _OP_REGISTERED = True
+    return True
+
+def rmsnorm(input: torch.Tensor, weight: torch.Tensor) -&gt; torch.Tensor:
+    register_tilelang_ops()
+    if _OP_REGISTERED:
+        out = torch.empty_like(input)
+        torch.ops.vllm.tilelang_rmsnorm(input, weight, out)
+        return out
+    # ④层回退: 纯 torch
+    inv = torch.rsqrt(input.float().pow(2).mean(-1, keepdim=True) + 1e-6)
+    return (input.float() * inv).to(input.dtype) * weight.float()
+</code></pre>
+      <p><strong>为什么必须注册</strong>：未注册的 Python 侧 TileLang 调用在 <code>torch.compile</code> 看来是黑盒副作用 → 图断裂；在 CUDA Graph 捕获里则是非法操作。注册后它成为原子算子，与 15.5⑤ 一致。</p>
+      <h3>② kernel 工厂 + Deferred 缓存（kernels.py 骨架）</h3>
+      <div class="code-head"><span>kernels.py · 工厂 + Deferred 缓存</span></div>
+      <pre><code class="language-python">_CACHE: dict = {}
+TILELANG_ENABLED = False
+try:
+    from vllm.platforms import current_platform
+    from vllm.utils.import_utils import has_tilelang
+    TILELANG_ENABLED = has_tilelang() and current_platform.is_cuda()
+except Exception:
+    pass
+if TILELANG_ENABLED:
+    import tilelang
+    import tilelang.language as T
+
+def get_rmsnorm_kernel(num_tokens: int, hidden: int, dtype: torch.dtype):
+    """(num_tokens, hidden, dtype) 是编译期常量 → 同键复用, 异键新编"""
+    key = (num_tokens, hidden, dtype)
+    if key not in _CACHE:
+        assert TILELANG_ENABLED
+        dt = "bfloat16" if dtype == torch.bfloat16 else "float16"
+
+        @tilelang.jit
+        def _factory(rows: int, cols: int, dt: str):
+            @T.prim_func
+            def main(X: T.Tensor((rows, cols), dt),
+                     W: T.Tensor((cols,), dt),
+                     Y: T.Tensor((rows, cols), dt)):       # ★ 输出由调用方传入 → 零拷贝
+                with T.Kernel(rows, threads=256) as (r):
+                    x_f  = T.alloc_fragment((cols,), "float")
+                    sqr  = T.alloc_fragment((cols,), "float")
+                    red  = T.alloc_fragment((1,), "float")
+                    T.copy(X[r, 0], x_f)
+                    for d in T.Parallel(cols):
+                        sqr[d] = x_f[d] * x_f[d]
+                    T.reduce_sum(sqr, red, dim=0, clear=True)
+                    inv = 1.0 / T.sqrt(red[0] / cols + 1e-6)
+                    for d in T.Parallel(cols):
+                        x_f[d] = x_f[d] * inv * W[d]
+                    T.copy(x_f, Y[r, 0])
+            return main
+        _CACHE[key] = _factory(num_tokens, hidden, dt)
+    return _CACHE[key]
+</code></pre>
+      <blockquote><p><strong>零拷贝要点</strong>：教学版 <code>@tilelang.jit(out_idx=[-1])</code> 让 tilelang 内部分配输出，wrapper 里还得 <code>out.copy_(result)</code> 白付一次 D2D；生产版把输出张量作为 <code>prim_func</code> 参数（如上）直接写入 vLLM 预分配的 buffer。</p></blockquote>
+      <h3>③ 启动期 warmup（对齐 vLLM <code>jit_warmup_tilelang_helper</code>）</h3>
+      <div class="code-head"><span>warmup.py · 启动期预热</span></div>
+      <pre><code class="language-python"># warmup.py —— 只编译不执行, 把 JIT 开销从首个真实请求挪到启动(与 CUDA Graph 预录制同哲学)
+from .kernels import get_rmsnorm_kernel
+
+def warmup(cuda_graph_sizes=(1, 2, 4, 8, 16, 32), hidden: int = 4096):
+    """★ capture 尺寸表就是 warmup 清单: CUDA Graph 按这几个 M 录图, kernel 就按这几个 M 编译"""
+    import torch
+    for m in cuda_graph_sizes:
+        get_rmsnorm_kernel(m, hidden, torch.bfloat16)
+</code></pre>
+      <p>编译产物落盘复用：TileLang v0.1.13+ 支持跨主机二进制缓存——把缓存目录打进镜像或挂载卷，多机同型集群只需编译一次。</p>
+      <h3>④⑤⑥ PassConfig 注入 / 平台门卫 / 回退链</h3>
+      <p>分别见 16.7.2、16.7.1、16.8① 的回退写法——三个模式拼起来即完整工业位形。</p>
+      <h3>⑦ 完整集成配置示例：一个可落地的 TileLang 插件包</h3>
+      <p>第 13 章讲过 vLLM 的三类入口点，<strong>内核类插件只需要 <code>vllm.general_plugins</code></strong>（所有进程加载、必须幂等——重复注册由 ops.py 的 <code>_OP_REGISTERED</code> 门闩兜住）。</p>
+      <p><strong><code>pyproject.toml</code></strong>（打包与发现配置）：</p>
+      <div class="code-head"><span>pyproject.toml</span></div>
+      <pre><code class="language-toml">[build-system]
+requires = ["setuptools&gt;=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "my-vllm-tilelang-ops"
+version = "0.1.0"
+description = "TileLang 高性能算子插件（教程第 16 章配套）"
+requires-python = "&gt;=3.10"
+dependencies = ["vllm", "tilelang&gt;=0.1.13"]   # ★ tilelang 声明为硬依赖, has_tilelang() 才可靠为 True
+
+# vLLM 通过该 entry-point 组发现插件; 指向零参函数, vLLM 在每个进程调用一次
+[project.entry-points."vllm.general_plugins"]
+tilelang_ops = "my_vllm_tilelang_ops:register"
+
+[tool.setuptools.packages.find]
+include = ["my_vllm_tilelang_ops*"]
+</code></pre>
+      <p><strong><code>__init__.py</code></strong>（插件入口：平台门卫 + op 注册 + 环境变量配置 + 可选 warmup + 模型接线）：</p>
+      <div class="code-head"><span>__init__.py · 插件入口 register()</span></div>
+      <pre><code class="language-python"># -*- coding: utf-8 -*-
+"""TileLang 算子插件入口。
+vLLM 在 process0 / EngineCore / 每个 Worker 进程各调用一次 register()
+→ 必须幂等; warmup 只在持有 GPU 的 worker 里真正编译, 无 GPU 进程静默跳过。
+"""
+import logging
+import os
+
+logger = logging.getLogger(__name__)
+
+
+def register():
+    from my_vllm_tilelang_ops import ops, warmup as warmup_mod
+    from vllm.platforms import current_platform
+
+    # ---- 平台门卫(16.7.1): 仅 CUDA 启用; 昇腾/AMD 的扩展写法见 16.7.3/16.7.4 ----
+    if not (current_platform.is_cuda() and ops.register_tilelang_ops()):
+        logger.info("[tilelang_ops] 平台不启用 TileLang, 走内置回退链(16.7.1)")
+        return
+
+    # ---- 配置项: 环境变量驱动(风格对齐 vLLM 自身的环境变量约定) ----
+    # MY_TILELANG_WARMUP: 逗号分隔的 warmup token 数; "0" = 关闭; 默认对齐 CUDA Graph 尺寸
+    warmup_env = os.environ.get("MY_TILELANG_WARMUP", "1,2,4,8,16,32")
+    if warmup_env != "0":
+        sizes = tuple(int(s) for s in warmup_env.split(","))
+        hidden = int(os.environ.get("MY_TILELANG_HIDDEN", "4096"))
+        try:
+            warmup_mod.warmup(sizes, hidden)
+            logger.info("[tilelang_ops] warmup 完成: sizes=%s hidden=%d", sizes, hidden)
+        except Exception:
+            # 引擎/前端进程没有 GPU 属预期 → 运行期 JIT 兜底, 不能让插件加载失败
+            logger.warning("[tilelang_ops] warmup 跳过(本进程无 GPU 或编译失败)")
+
+    # ---- 模型接线(可选, MY_TILELANG_PATCH_MODELS=1 打开) ----
+    if os.environ.get("MY_TILELANG_PATCH_MODELS") == "1":
+        patch_target_rmsnorm()
+</code></pre>
+      <p><strong>模型接线</strong>（被 <code>register()</code> 调用；两种深度，原型用 A、上线用 B）：</p>
+      <div class="code-head"><span>模型接线（monkey patch / ModelRegistry）</span></div>
+      <pre><code class="language-python"># 方式 A: 猴子补丁 —— 无侵入, 快速验证收益(注意守好残差分支!)
+def patch_target_rmsnorm():
+    from my_vllm_tilelang_ops import ops
+    from vllm.model_executor.layers.layernorm import RMSNorm   # 路径以 v0.31 源码为准
+
+    _orig_forward = RMSNorm.forward_cuda
+    def forward(self, x, residual=None):
+        if residual is not None:          # 残差融合分支语义不同, 保守回退原实现
+            return _orig_forward(self, x, residual)
+        return ops.rmsnorm(x, self.weight)   # ← 注册过的 custom op, 图内合法
+    RMSNorm.forward_cuda = forward
+
+# 方式 B: 自定义模型 + ModelRegistry(第 10 章正路; 在插件 general 里一行接入):
+#   from vllm.model_executor.models.registry import ModelRegistry
+#   ModelRegistry.register_model("MyQwen3ForCausalLM", "my_ops.models:MyQwen3ForCausalLM")
+#   模型代码的 attention/MLP 中直接调用 torch.ops.vllm.tilelang_xxx(...)
+</code></pre>
+      <p><strong>启动配置</strong>（容器内，命令风格与第 02/09 章一致）：</p>
+      <div class="code-head"><span>启动配置（bash）</span></div>
+      <pre><code class="language-bash">pip install -e /path/to/my-vllm-tilelang-ops   # 安装即被发现, general 类无需 VLLM_PLUGINS 白名单
+
+# 配置: hidden 与 warmup 尺寸都要和目标模型/启动参数对齐
+export MY_TILELANG_HIDDEN=4096                  # Qwen3-8B: 4096 / GLM-4.5: 4096+ / DeepSeek-V3: 7168
+export MY_TILELANG_WARMUP=1,2,4,8,16,32,64,128  # ★ 与 --max-cuda-graph-sizes 完全一致
+export MY_TILELANG_PATCH_MODELS=1               # 打开 RMSNorm 替换(先用注释态跑基线)
+
+vllm serve Qwen/Qwen3-8B --max-model-len 8192 \
+  --max-cuda-graph-sizes 1,2,4,8,16,32,64,128   # 与 warmup 清单一一对应(16.8③ 的铁律)
+</code></pre>
+      <p>两点强调：</p>
+      <ul>
+        <li><code>dependencies</code> 写明 <code>tilelang</code> 后，插件的 <code>has_tilelang()</code> 才可靠为 True——对你自己的插件而言"可选依赖"应升级为硬依赖（版本对齐表见 16.1.3）；</li>
+        <li>general 插件在<strong>所有进程</strong>执行，warmup 只在持 GPU 的 worker 里生效；其他进程的失败必须被 try/except 吞掉，否则会拖垮整个 vLLM 启动（第 13 章幂等军规的内核版）。</li>
+      </ul>
+      <h3>⑧ 注意力后端级集成：让 DeepSeek 用上你的 MLA kernel（进阶）</h3>
+      <p>16.5.2 的 MLA kernel 想真正发挥威力，要接进 vLLM 的注意力后端选择链（第 14 章 14.2），而不只是替换一个 RMSNorm。集成分三层深度，按收益/成本递增：</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>深度</th><th>做法</th><th>工程量</th><th>适用算子</th></tr></thead>
+        <tbody>
+          <tr><td>算子级（⑦）</td><td>补丁/自定义模型中调 custom op</td><td>低</td><td>RMSNorm / RoPE / MoE GEMM / W4A16</td></tr>
+          <tr><td>后端级（本节）</td><td>自定义 AttentionBackend + 接入选择链</td><td>中</td><td>MLA / GQA decode 等核心注意力</td></tr>
+          <tr><td>运行时级</td><td>TileRT 式 V1 connector（PD 分离，vLLM 管其余、它管解码）</td><td>高</td><td>整段解码接管</td></tr>
+        </tbody>
+      </table></div>
+      <p>自定义后端骨架（V1 架构；类名/方法签名以 v0.31 源码 <code>vllm/v1/attention_backends/</code> 为准）：</p>
+      <div class="code-head"><span>backend.py · TileLangMLABackend 骨架</span></div>
+      <pre><code class="language-python"># backend.py —— 最小骨架: 只接管 decode 路径, 其余显式路由到内置后端(回退链 ②→③)
+import torch
+from vllm.v1.attention_backends.backend import AttentionBackend   # 路径以源码为准
+
+
+class TileLangMLABackend(AttentionBackend):
+    @staticmethod
+    def get_supported_dtypes():
+        return (torch.bfloat16,)
+
+    @staticmethod
+    def get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size):
+        # 与 16.5.2 kernel 严格对齐: MLA cache 每行 576 = [c(512) | k_pe(64)]
+        return (num_blocks, block_size, head_size)
+
+    def forward_decode(self, q, kv_cache, attn_metadata, **kwargs):
+        # 命中 16.5.2 的 mla_paged_decode(shape/dtype 命中时)
+        return self._kernels.mla_decode(
+            q, kv_cache,
+            attn_metadata.block_table,      # (B, MAX_PAGES) int32
+            attn_metadata.seq_lens)         # (B,) int32
+
+    # forward_prefill / forward_insert 等其余方法: 委托给内置 FlashMLA/FlashInfer
+    # —— "只做我们最快的那段" 是回退链在注意力层的落点
+</code></pre>
+      <p>注册与选择（与 ⑦ 的 <code>register()</code> 合流）：</p>
+      <div class="code-head"><span>注册与选择（backend registry）</span></div>
+      <pre><code class="language-python"># 插件 __init__.py 追加(注册 API 以 v0.31 backend registry 源码为准):
+#   from vllm.v1.attention_backends.registry import register_backend
+#   register_backend("TILELANG_MLA", TileLangMLABackend)
+
+# 启动时强制选择(vLLM 官方开关):
+export VLLM_ATTENTION_BACKEND=TILELANG_MLA
+</code></pre>
+      <p>工业建议：后端级接入的收益/成本比通常低于算子级——<strong>先用 ⑦ 的算子级集成跑第 9 章压测，确认收益存在，再决定是否下沉</strong>。且必须保住回退语义：shape/dtype 不命中时显式路由到 FlashMLA/FlashInfer（16.7.1 回退链），不允许"半支持"状态在线上裸奔。</p>
+      <h3>⑨ Docker / 集群级配置</h3>
+      <div class="code-head"><span>Dockerfile · 生产集成镜像</span></div>
+      <pre><code class="language-dockerfile"># 在 16.1.1 的基础镜像上追加(生产集成镜像)
+COPY my-vllm-tilelang-ops /opt/my-vllm-tilelang-ops
+RUN pip install -e /opt/my-vllm-tilelang-ops
+
+# ★ 预热进镜像: 构建期把 warmup 清单全部编译进 JIT 缓存 → 运行期零编译
+#   (需带 GPU 的构建机; 或改在容器入口脚本 preheat)
+RUN python -c "from my_vllm_tilelang_ops.warmup import warmup; \
+    warmup((1,2,4,8,16,32,64,128), hidden=4096)"
+
+ENV MY_TILELANG_WARMUP=1,2,4,8,16,32,64,128 \
+    MY_TILELANG_HIDDEN=4096
+VOLUME ["/root/.tilelang/cache"]     # TileLang JIT 缓存目录: 挂卷后同型节点扩容零编译(16.2.5)
+</code></pre>
+      <ul>
+        <li>缓存卷化后，集群扩容/多机分发<strong>不再重复编译</strong>（16.8③ 的跨主机二进制缓存）；</li>
+        <li>构建期预热需要 nvidia container toolkit 的带卡构建机；无卡 CI 环境跳过该步，靠运行期 JIT 兜底；</li>
+        <li>灰度路径：先 1 台开 <code>MY_TILELANG_PATCH_MODELS=1</code> 压测对比 → 通过 16.7.5 CI 矩阵 → 全量。</li>
+      </ul>
+      <h3>验收集成成功</h3>
+      <div class="code-head"><span>验收集成成功（bash）</span></div>
+      <pre><code class="language-bash"># 0) 插件被发现: entry point 已注册(应输出包含 tilelang_ops)
+python -c "from importlib.metadata import entry_points; \
+  print([e.name for e in entry_points(group='vllm.general_plugins')])"
+# 1) 图完整性: torch.compile 下无 graph break 日志
+# 2) 端到端: vllm serve 起服务, 第 9 章压测脚本对比 TTFT/TPOT
+# 3) 日志确认 warmup 命中(无运行期编译)
+</code></pre>
+
+      <h2><span class="sec-no">16.9</span>性能工程与精度保障</h2>
+      <h3>16.9.1 工具链全景</h3>
+      <div class="table-wrap"><table>
+        <thead><tr><th>阶段</th><th>工具</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><td>写前估算</td><td>TileSight</td><td>tile 中心分析式性能模型，预估耗时/缓存流量</td></tr>
+          <tr><td>编译诊断</td><td>LSP、source-aware diagnostics、IR Lower Trace</td><td>看布局推导结果、逐 pass 检查</td></tr>
+          <tr><td>kernel 内调试</td><td><code>T.print</code></td><td>打印中间 buffer（官方 debug 教程）</td></tr>
+          <tr><td>生成质量</td><td><code>kernel.get_kernel_source()</code></td><td>检查生成的 CUDA/汇编（有无 TMA、流水深度）</td></tr>
+          <tr><td>GPU 剖析</td><td>ncu（第 14 章）、IKET profiler（CUDA 时间线）</td><td>bank conflict / 占用率 / 溢出</td></tr>
+          <tr><td>编译期开销</td><td>pass timing（PR #2622）</td><td>定位慢编译 pass</td></tr>
+        </tbody>
+      </table></div>
+      <h3>16.9.2 参数 sweep 脚本模板（一劳永逸）</h3>
+      <div class="code-head"><span>lab/tilelang/04_sweep_gemm.py</span></div>
+      <pre><code class="language-python"># lab/tilelang/04_sweep_gemm.py —— 把 15.7 的"实验 15-4"脚本化
+import itertools, torch, tilelang
+from importlib import import_module
+gemm = import_module("01_gemm_tilelang")           # 15 章 lab 的 kernel 工厂
+
+def bench(fn, iters=50):
+    for _ in range(10): fn()
+    torch.cuda.synchronize()
+    t0, t1 = torch.cuda.Event(True), torch.cuda.Event(True)
+    t0.record()
+    for _ in range(iters): fn()
+    t1.record(); torch.cuda.synchronize()
+    return t0.elapsed_time(t1) / iters * 1e3        # us
+
+M = N = K = 4096
+a = torch.randn(M, K, device="cuda", dtype=torch.float16)
+b = torch.randn(K, N, device="cuda", dtype=torch.float16)
+rows = []
+for bm, bn, bk, st in itertools.product(
+        (64, 128, 256), (64, 128, 256), (32, 64, 128), (2, 3, 4)):
+    tag = f"bm={bm},bn={bn},bk={bk},st={st}"
+    try:
+        k = gemm.matmul(M, N, K, block_M=bm, block_N=bn, block_K=bk, num_stages=st)
+        t = bench(lambda: k(a, b))
+        rows.append((tag, t, 2*M*N*K/(t*1e-6)/1e12))
+    except Exception as e:                          # smem 超限/寄存器溢出等 → 记录跳过
+        rows.append((tag, -1, f"FAIL:{type(e).__name__}"))
+for tag, t, x in sorted(rows, key=lambda r: -(r[2] if isinstance(r[2], float) else 0)):
+    print(f"{tag:36s} {t:9.1f}us {x}")
+</code></pre>
+      <p>扫参顺序按影响从大到小：<code>block_M/N/K</code> → <code>num_stages</code> → <code>threads</code> → swizzle →（最后）<code>annotate_layout</code>。</p>
+      <h3>16.9.3 精度对拍体系（上线前必过）</h3>
+      <p>三层对拍：<strong>单算子 → 子图（norm+rope+attn）→ 端到端（vLLM 跑通 + 输出分布 sanity）</strong>。</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>精度路径</th><th>对拍基准</th><th>容差起点</th><th>备注</th></tr></thead>
+        <tbody>
+          <tr><td>fp16 GEMM</td><td>cuBLAS</td><td>rtol=atol=1e-2</td><td>15.2 同款</td></tr>
+          <tr><td>bf16 逐元素/融合核</td><td>torch 实现（fp32 中间）</td><td>rtol=atol=1.6e-2</td><td>bf16 精度宽</td></tr>
+          <tr><td>注意力</td><td>torch SDPA</td><td>rtol=1e-3 / atol=1e-2</td><td>softmax 后幅值有界</td></tr>
+          <tr><td>fp8/w4a16</td><td>逐层 dequant 参考实现 + 端到端 ppl</td><td>单层 1e-1 量级，端到端看 ppl 漂移</td><td>按模型校准</td></tr>
+          <tr><td>必测边界</td><td>空序列、S=1、seqlen=block 整数倍±1、全掩码行</td><td>NaN/Inf 零容忍</td><td>哨兵值方案(16.4)的回归测试</td></tr>
+        </tbody>
+      </table></div>
+
+      <h2><span class="sec-no">16.10</span>工业 Checklist 与排错 FAQ</h2>
+      <p><strong>上线 Checklist</strong>（15.6 的超集）：</p>
+      <ul>
+        <li>☐ 回退链完整（①专属 → ②TileLang → ③Triton/内置 → ④torch），每层有平台门卫</li>
+        <li>☐ custom op 注册 + <code>mutates_args</code> 正确；torch.compile 无 graph break</li>
+        <li>☐ warmup 覆盖全部 CUDA Graph capture 尺寸；运行期零 JIT 编译</li>
+        <li>☐ PassConfig 与目标硬件绑定（16.7.2）</li>
+        <li>☐ 三层精度对拍通过（16.9.3），边界 shape 含 NaN 检查</li>
+        <li>☐ sweep 过 tile/stages；ncu 无恶性 bank conflict / 寄存器溢出</li>
+        <li>☐ CI 矩阵（16.7.5）至少覆盖目标硬件 × 主力 dtype</li>
+        <li>☐ 二进制缓存/预编译分发方案就位（16.8③）</li>
+      </ul>
+      <p><strong>FAQ·编译失败</strong></p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>症状</th><th>原因</th><th>处方</th></tr></thead>
+        <tbody>
+          <tr><td>shared memory exceeded</td><td>tile×stages 太大</td><td>减 block 或 num_stages；看 <code>get_kernel_source</code> 查缓冲</td></tr>
+          <tr><td>TMA lowering 报错</td><td>Hopper 新路径不稳</td><td><code>TL_DISABLE_TMA_LOWER=True</code>（vLLM 同款）</td></tr>
+          <tr><td>warp-specialize 崩溃</td><td>同上</td><td><code>TL_DISABLE_WARP_SPECIALIZED=True</code></td></tr>
+          <tr><td>大量寄存器 spill</td><td>fragment 过大 / 策略不当</td><td>换 GemmWarpPolicy、减 block、调 <code>TL_PTXAS_REGISTER_USAGE_LEVEL</code></td></tr>
+          <tr><td>shape 整除断言失败</td><td>gemm 维度 &lt;16 或不整除</td><td>pad 到 ≥16；<code>T.ceildiv</code>+掩码（16.6.1 模板）</td></tr>
+        </tbody>
+      </table></div>
+      <p><strong>FAQ·精度</strong></p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>症状</th><th>原因</th><th>处方</th></tr></thead>
+        <tbody>
+          <tr><td>输出 NaN</td><td><code>-inf</code> 掩码自减</td><td>改有限哨兵 <code>-1e6</code>（16.4）</td></tr>
+          <tr><td>长序列精度漂移</td><td>fp16 累加</td><td>累加器必须 fp32（<code>accum_dtype="float"</code>）</td></tr>
+          <tr><td>attention 与 SDPA 有偏</td><td>忘了 scale 预乘 log2e / 掩码边界</td><td>检查 <code>* 1.44269504</code> 与页尾掩码</td></tr>
+          <tr><td>量化模型离群</td><td>zero-point 处理错</td><td>对照官方 <code>examples/dequantize_gemm</code>，区分对称/asymmetric</td></tr>
+        </tbody>
+      </table></div>
+      <p><strong>FAQ·性能</strong></p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>症状</th><th>原因</th><th>处方</th></tr></thead>
+        <tbody>
+          <tr><td>TFLOPS &lt;50% cuBLAS</td><td>tile/流水没调对</td><td>按 16.9.2 顺序 sweep；开 swizzle</td></tr>
+          <tr><td>decode 不如内置后端</td><td>group 小，M 维不足</td><td>认清战场：decode 走官方，TileLang 做 prefill/融合（16.6.0）</td></tr>
+          <tr><td>每请求首次调用卡顿</td><td>运行期 JIT</td><td>warmup 清单补 shape（16.8③）</td></tr>
+          <tr><td>e2e 无提升</td><td>瓶颈不在该算子</td><td>回 14.5 先量化再动手</td></tr>
+        </tbody>
+      </table></div>
+      <p><strong>FAQ·集成</strong></p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>症状</th><th>原因</th><th>处方</th></tr></thead>
+        <tbody>
+          <tr><td><code>has_tilelang()</code> False</td><td>包没装/环境不符</td><td>16.1.1 重装并验证</td></tr>
+          <tr><td>graph break</td><td>未注册 custom op</td><td>16.8①</td></tr>
+          <tr><td>CUDA Graph 捕获报错</td><td>kernel 内部分配/同步</td><td>输出改由调用方传入（零拷贝版）</td></tr>
+          <tr><td>多进程 worker 重复编译</td><td>缓存不共享</td><td>二进制缓存目录挂载/进镜像（16.8③）</td></tr>
+        </tbody>
+      </table></div>
+      <p><strong>FAQ·昇腾 NPU</strong></p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>症状</th><th>原因</th><th>处方</th></tr></thead>
+        <tbody>
+          <tr><td>后端找不到</td><td>版本不含 Ascend</td><td>950→主线 v0.1.15+；910B→tilelang-ascend 仓库</td></tr>
+          <tr><td>算子行为差异</td><td>Cube tile 约束不同</td><td>按 NPU 重扫 tile 参数（16.9.2）</td></tr>
+          <tr><td>与 vllm-ascend 冲突</td><td>平台判定写死 CUDA</td><td>16.7.3 的防御式门卫</td></tr>
+        </tbody>
+      </table></div>
+
+      <h2><span class="sec-no">16.11</span>实验总表 + 自测 + 参考资料</h2>
+      <p><strong>实验</strong>（本章 kernel 代码均为完整可落地版本，存入 <code>lab/tilelang/</code> 即可跑）：</p>
+      <div class="table-wrap"><table>
+        <thead><tr><th>实验</th><th>落地文件（建议名）</th><th>学习点</th><th>完成标准</th></tr></thead>
+        <tbody>
+          <tr><td>🔬 16-1 MLA paged decode</td><td><code>05_mla_decode.py</code></td><td>分页+吸收+动态循环</td><td>与 FlashMLA/SDPA 对拍；记录 H100/4060 成绩</td></tr>
+          <tr><td>🔬 16-2 varlen GQA prefill</td><td><code>06_gqa_varlen.py</code></td><td>变长+因果+谓词写回</td><td>与 SDPA 等价（含前缀场景）</td></tr>
+          <tr><td>🔬 16-3 QK-Norm+RoPE 融合</td><td><code>07_qk_norm_rope.py</code></td><td>融合减访存</td><td>带宽 ≥70% 理论值，数值一致</td></tr>
+          <tr><td>🔬 16-4 MoE grouped GEMM</td><td><code>08_moe_grouped.py</code></td><td>专家按块查表</td><td>对比逐专家循环的加速比</td></tr>
+          <tr><td>🔬 16-5 W4A16 dequant</td><td><code>09_w4a16.py</code></td><td>位运算解包</td><td>对拍 dequant 参考实现</td></tr>
+          <tr><td>🔬 16-6 vLLM 插件集成</td><td>16.8 模板建包</td><td>custom op/warmup</td><td>vLLM e2e 跑通 + 无 graph break</td></tr>
+          <tr><td>🔬 16-7 昇腾验证</td><td>16.7.3 路线</td><td>同源码跨硬件</td><td>任一 NPU 上 GEMM/FA 出数并对拍</td></tr>
+        </tbody>
+      </table></div>
+      <details class="quiz">
+        <summary>📋 本章自测</summary>
+        <div class="quiz-body">
+          <ol>
+            <li>MLA 的 KV cache 为什么是 576 维？吸收前后 softmax scale 为什么不变？</li>
+            <li><code>T.Pipelined</code> 的循环上界用运行时标量（<code>seq_lens[b]</code>）在什么场景是必需的？编译器如何配合？</li>
+            <li>为什么全章用 <code>-1e6</code> 而非 <code>-inf</code> 做掩码？写出会出 NaN 的具体表达式。</li>
+            <li>head-as-row 技巧解决什么问题？为什么对 Qwen decode 反而不适用？</li>
+            <li><code>mutates_args</code> 写错会发生什么（从 CUDA Graph 与 torch.compile 两个角度）？</li>
+            <li>vLLM 为什么在生产 PassConfig 里关 warp-specialized 与 TMA lowering？你的 H100 上何时该开？</li>
+            <li>昇腾 950 与 910B 的 TileLang 路线有何不同？在 NPU 上 TileLang 的生态位为什么更重要？</li>
+            <li>二进制跨主机缓存对集群部署意味着什么？</li>
+          </ol>
+        </div>
+      </details>
+      <p><strong>参考资料</strong>：</p>
+      <ul>
+        <li>官方文档 <a href="https://tilelang.com/">tilelang.com</a> ｜ 仓库 <a href="https://github.com/tile-ai/tilelang">tile-ai/tilelang</a> ｜ 示例库 <a href="https://github.com/tile-ai/tilelang/tree/main/examples">examples/</a>（GEMM / FlashAttention / deepseek_mla / dequantize_gemm / linear_attention / native_sparse_attention）</li>
+        <li>生态：<a href="https://github.com/tile-ai/TileOPs">TileOPs</a> ｜ <a href="https://github.com/tile-ai/TileRT">TileRT</a> ｜ <a href="https://github.com/tile-ai/tilelang-ascend">tilelang-ascend</a> ｜ <a href="https://github.com/tile-ai/TileSight">TileSight</a> ｜ <a href="https://github.com/tile-ai/tilelang-puzzles">tilelang-puzzles</a></li>
+        <li>vLLM：<code>vllm/utils/import_utils.py</code>（<code>has_tilelang</code>）｜ <code>vllm/tilelang_utils/</code> ｜ <a href="https://vllm.ai/blog/2026-10-07-deepseek-v41-flash">DeepSeek-V4.1-Flash on vLLM 博客</a></li>
+        <li>本教程内：<a href="ch15.html">第 15 章</a>（入门与五类原语）｜ <a href="ch11.html">第 11 章</a>（三大模型结构）｜ <a href="ch12.html">第 12 章</a>、<a href="ch14.html">第 14 章</a>（硬件抽象与内核链路）｜ <a href="ch13.html">第 13 章</a>（插件打包）</li>
+      </ul>
+
+      <nav class="pager">
+        <a href="ch15.html"><div class="dir">← 上一章</div><div class="title">第 15 章 · 性能优化方法论与 TileLang 算子实战</div></a>
+        <a class="next" href="appendix.html"><div class="dir">下一章 →</div><div class="title">附录 · 速查表 / 术语表 / 常见问题</div></a>
+      </nav>
+      <footer>vLLM 定制开发教程 · 可视化网页版 ｜ <a href="../index.html">返回目录</a></footer>
+    </article>
+  </div>
+</div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/visuals.js"></script>
+<script src="../assets/js/mathjax-tex-svg.js"></script>
+</body>
+</html>

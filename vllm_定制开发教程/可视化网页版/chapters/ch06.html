@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 06 章 · 一次请求的完整旅程（源码走读） ｜ vLLM 定制开发教程</title>
+<link rel="stylesheet" href="../assets/css/style.css">
+</head>
+<body>
+<div class="layout">
+<aside class="sidebar">
+  <a class="brand" href="../index.html">
+    <div class="logo">vLLM 定制开发教程</div>
+    <div class="sub">原理 + 实操，知行合一 · v0.31.0</div>
+  </a>
+  <nav>
+    <a href="../index.html"><span class="ch">🏠</span>课程首页</a>
+    <div class="nav-part">第一部分 · 打地基</div>
+    <a href="ch01.html"><span class="ch">01</span>大模型推理基础</a>
+    <a href="ch02.html"><span class="ch">02</span>环境安装与第一次推理</a>
+    <div class="nav-part">第二部分 · 核心原理</div>
+    <a href="ch03.html"><span class="ch">03</span>整体架构鸟瞰</a>
+    <a href="ch04.html"><span class="ch">04</span>PagedAttention 与 KV Cache</a>
+    <a href="ch05.html"><span class="ch">05</span>调度器与连续批处理</a>
+    <a href="ch06.html"><span class="ch">06</span>一次请求的完整旅程</a>
+    <div class="nav-part">第三部分 · 进阶</div>
+    <a href="ch07.html"><span class="ch">07</span>分布式并行 TP/PP/EP</a>
+    <a href="ch08.html"><span class="ch">08</span>高级特性</a>
+    <a href="ch09.html"><span class="ch">09</span>服务化部署与性能调优</a>
+    <div class="nav-part">第四部分 · 定制</div>
+    <a href="ch10.html"><span class="ch">10</span>接入自己的模型</a>
+    <a href="ch11.html"><span class="ch">11</span>DeepSeek/GLM/Qwen 接入</a>
+    <a href="ch12.html"><span class="ch">12</span>异构硬件部署</a>
+    <a href="ch13.html"><span class="ch">13</span>插件机制实现细节</a>
+    <div class="nav-part">第五部分 · 内核级</div>
+    <a href="ch14.html"><span class="ch">14</span>硬件与模型适配细节</a>
+    <a href="ch15.html"><span class="ch">15</span>性能优化与 TileLang</a>
+    <a href="ch16.html"><span class="ch">16</span>TileLang 内核开发指南</a>
+    <div class="nav-part">资料</div>
+    <a href="appendix.html"><span class="ch">附</span>速查表与常见问题</a>
+  </nav>
+</aside>
+  <div class="main">
+    <div class="topbar">
+      <button class="menu-btn">☰</button>
+      <div class="crumb"><b>第 06 章</b> · 一次请求的完整旅程</div>
+      <div class="reading-progress"></div>
+    </div>
+    <article class="content">
+      <header class="chapter-hero">
+        <div class="kicker">CHAPTER 06</div>
+        <h1>一次请求的完整旅程（源码走读）</h1>
+        <div class="badges"><span class="badge">🔖 vLLM v0.31.0</span><span class="badge lab">🔧 动手实验</span></div>
+        <div class="goal">本章目标：跟着一个 HTTP 请求钻进 vLLM 源码，从 FastAPI 路由一路走到 CUDA 内核再回来。学完你将获得"源码导航能力"——以后任何 vLLM 问题，都知道去哪个文件找答案。所有路径基于 vLLM v0.31.0。</div>
+      </header>
+
+      <h2><span class="sec-no">6.0</span>走读前的准备</h2>
+      <div class="code-head"><span>bash</span></div>
+      <pre><code class="language-bash"># 找到 vLLM 源码位置，用支持"跳转定义"的编辑器（VSCode + Pylance）打开
+python -c "import vllm, os; print(os.path.dirname(vllm.__file__))"</code></pre>
+      <p>走读纪律（小白最容易犯的错）：</p>
+      <ol>
+        <li><strong>跟着请求走，不顺着文件读</strong>——只看请求经过的代码；</li>
+        <li>先看函数<strong>签名和 docstring</strong>，再决定要不要进函数体；</li>
+        <li>每个函数只回答一个问题："它为这个请求做了什么"。</li>
+      </ol>
+
+      <h2><span class="sec-no">6.1</span>全景时序图</h2>
+      <div class="code-head"><span>示意 · 请求全链路时序</span></div>
+      <pre><code class="language-text">用户                进程1: api_server           进程2: EngineCore           GPU
+ │  POST /v1/chat/completions   │                     │                     │
+ │─────────────────────────────▶│                     │                     │
+ │                   ①路由/校验/拼模板                 │                     │
+ │                   ②AsyncLLM.add_request() ──ZMQ──▶ │                     │
+ │◀─── SSE: 打字机效果 ───────────────────────────────│                     │
+ │                               │        ③Scheduler.schedule() 每步循环 │
+ │                               │        ④ModelRunner.execute_model()─▶│ 前向
+ │                               │        ⑤采样出新 token               │◀┘
+ │                   ⑥OutputProcessor 还原文字 ──ZMQ──▶│                     │
+ │◀──────────────────────────────│                     │                     │</code></pre>
+      <div class="viz" data-viz="journey-flow">
+        <div class="viz-head"><span class="dot"></span><span class="title">请求旅程步进图：从 HTTP 到第一个 token</span><span class="desc">点步骤芯片或"下一步"，逐站走读（详情对应正文 6.2~6.5）</span></div>
+        <div class="viz-body"></div>
+        <script type="application/json" class="viz-cfg">{"steps":[
+{"title":"HTTP 请求到达 API 层","detail":"vLLM 用 FastAPI 在 <code>vllm/entrypoints/openai/api_server.py</code> 定义了完整的 OpenAI 兼容路由：<code>/v1/chat/completions</code>、<code>/v1/completions</code>、<code>/v1/models</code>、<code>/v1/embeddings</code> 等，请求在这里被接收。","code":"POST /v1/chat/completions → api_server.py"},
+{"title":"校验并拼装 prompt","detail":"读取 <code>model</code> → 应用 chat template（把 messages 数组渲染成模型的 prompt 字符串）→ 构造 <code>SamplingParams</code>。","code":"chat template → prompt 字符串；SamplingParams(...)"},
+{"title":"AsyncLLM.add_request() 非阻塞挂号","detail":"add_request 只是把请求放进队列就返回，绝不阻塞——这是 vLLM 能扛高并发的第一步。任务交给本文件的灵魂 <code>AsyncLLM</code>。","code":"vllm/v1/engine/async_llm.py · AsyncLLM.generate()"},
+{"title":"ZMQ 跨进程投递","detail":"<code>AsyncLLM</code> 与 <code>EngineCoreProc</code> 子进程之间是 ZMQ 双向通道：去程（请求）、回程（每步的 token 增量）。","code":"self.engine_core.add_request(...)  # ZMQ 发给引擎子进程"},
+{"title":"EngineCore 主循环 step()","detail":"引擎子进程（进程 2）常驻循环，每个\"节拍\"内完成调度、执行、回传三件事。","code":"vllm/v1/engine/core.py · while True: out = self.step()"},
+{"title":"Scheduler.schedule() 预算调度","detail":"按 token 预算与并发上限决定本步收谁、切多长、放不放、抢谁的，打包出 <code>SchedulerOutput</code>（第 05 章已精讲）。","code":"vllm/v1/core/sched/scheduler.py · schedule() → SchedulerOutput"},
+{"title":"多卡广播（可选）","detail":"如果配置了多卡（TP/PP），<code>model_executor</code> 会把这批任务广播给每张卡的 Worker（第 07 章）。","code":"vllm/v1/executor/ → 各 Worker.execute_model"},
+{"title":"GPUModelRunner.execute_model()","detail":"GPU 侧总入口，负责准备输入张量、选择执行路径、调用模型 forward、采样。","code":"vllm/v1/worker/gpu_model_runner.py · execute_model(scheduler_output)"},
+{"title":"准备输入张量与 KV 页表","detail":"把这一批所有请求的 token ids 拼接、按 <code>block_table</code> 定位每条序列的 KV 位置（其中就包括把页表传给注意力内核）。","code":"token ids 拼接 + block_table → attention metadata"},
+{"title":"选择执行路径","detail":"decode 批命中 CUDA Graph 直接重放（省掉上千次 kernel 启动开销）；prefill/混批走普通路径（V1 的 piecewise CUDA Graph 会分段处理）。","code":"CUDA Graph replay vs 普通执行路径"},
+{"title":"模型逐层 forward","detail":"进入 <code>vllm/model_executor/models/</code> 下对应模型（如 <code>qwen2.py</code> 的 <code>Qwen2ForCausalLM</code>），逐层执行。","code":"vllm/model_executor/models/qwen2.py · Qwen2ForCausalLM.forward()"},
+{"title":"页表感知的 FlashAttention","detail":"每层注意力调用 <code>vllm/v1/attention/backends/flash_attn.py</code>（FlashAttention 后端）——PagedAttention 在 V1 中以\"页表感知的 FlashAttention\"形式存在，按 block_table 逐块读取 KV 完成注意力计算（第 04 章机制在这里落地）。","code":"vllm/v1/attention/backends/flash_attn.py"},
+{"title":"采样出新 token","detail":"logits → <code>vllm/v1/sample/</code> 采样器（temperature/top_p/penalties...）→ 本步的 token id。","code":"vllm/v1/sample/ → 本步 token ids"},
+{"title":"回程：OutputProcessor + 增量反分词 → SSE","detail":"每请求独立状态机 <code>RequestState</code>（WAITING → RUNNING → FINISHED/ABORTED）；token id 经增量反分词（缓存不完整 UTF-8 字节，凑齐才输出）变成文字，组装 <code>RequestOutput</code> 推回 AsyncLLM；API 层把 delta 包成 SSE <code>data: {...}</code> 帧发出——\"打字机\"由此而来。","code":"vllm/v1/engine/output_processor.py + detokenizer.py → SSE stream"}
+]}</script>
+      </div>
+
+      <h2><span class="sec-no">6.2</span>第一站：API 层（进程 1）</h2>
+      <p><strong>文件：<code>vllm/entrypoints/openai/api_server.py</code></strong></p>
+      <ul>
+        <li>vLLM 用 FastAPI 定义了完整的 OpenAI 兼容路由：<code>/v1/chat/completions</code>、<code>/v1/completions</code>、<code>/v1/models</code>、<code>/v1/embeddings</code> 等；</li>
+        <li>收到 chat 请求后：读取 <code>model</code> → 应用 <strong>chat template</strong>（把 messages 数组渲染成模型的 prompt 字符串）→ 构造 <code>SamplingParams</code>；</li>
+        <li>然后把任务交给本文件的灵魂——<code>AsyncLLM</code>。</li>
+      </ul>
+      <p><strong>文件：<code>vllm/v1/engine/async_llm.py</code> → 类 <code>AsyncLLM</code></strong></p>
+      <div class="code-head"><span>vllm/v1/engine/async_llm.py</span></div>
+      <pre><code class="language-python">AsyncLLM.from_engine_args(engine_args)   # 启动时: 拉起 EngineCoreProc 子进程
+async def generate(request_id, prompt, params):
+    await self.output_handler ...        # 注册输出流
+    self.engine_core.add_request(...)    # ZMQ 发给引擎子进程
+    async for output in stream: ...      # 收一步吐一步</code></pre>
+      <p>要点：</p>
+      <ul>
+        <li><strong>add_request 只是"挂号"</strong>：它把请求放进队列就返回，绝不阻塞——这就是它能扛高并发的第一步；</li>
+        <li><code>AsyncLLM</code> 与 <code>EngineCoreProc</code> 之间是 <strong>ZMQ 双向通道</strong>：去程（请求）、回程（每步的 token 增量）。</li>
+      </ul>
+
+      <h2><span class="sec-no">6.3</span>第二站：引擎主循环（进程 2）</h2>
+      <p><strong>文件：<code>vllm/v1/engine/core.py</code> → 类 <code>EngineCore</code>（常驻循环体）</strong></p>
+      <div class="code-head"><span>vllm/v1/engine/core.py</span></div>
+      <pre><code class="language-python"># EngineCore 的主循环（简化示意，真实代码即 step 的重复）
+while True:
+    out = self.step()   # 一个"节拍"
+    # step 内部三连:
+    #   1. scheduled = self.scheduler.schedule()          # 第05章已精讲
+    #   2. output = self.model_executor.execute_model(scheduled)  # 下一站
+    #   3. 把每请求的新 token 通过 ZMQ 发回 AsyncLLM</code></pre>
+      <p>如果配置了多卡（TP/PP），<code>model_executor</code> 会<strong>广播</strong>这批任务给每张卡的 Worker（第 07 章）。</p>
+
+      <h2><span class="sec-no">6.4</span>第三站：模型执行层</h2>
+      <p><strong>文件：<code>vllm/v1/worker/gpu_model_runner.py</code> → 类 <code>GPUModelRunner</code></strong></p>
+      <p><code>execute_model(scheduler_output)</code> 是 GPU 侧的总入口，做四件事：</p>
+      <ol>
+        <li><strong>准备输入张量</strong>：把这一批所有请求的 token ids 拼接、按 <code>block_table</code> 定位每条序列的 KV 位置（其中就包括把页表传给注意力内核）；</li>
+        <li><strong>选择执行路径</strong>：decode 批命中 <strong>CUDA Graph</strong> 直接重放（省掉上千次 kernel 启动开销）；prefill/混批走普通路径（V1 的 piecewise CUDA Graph 会分段处理）；</li>
+        <li><strong>调用模型 forward</strong>：进入 <code>vllm/model_executor/models/</code> 下对应模型（如 <code>qwen2.py</code> 的 <code>Qwen2ForCausalLM</code>），逐层执行；</li>
+        <li><strong>注意力内核</strong>：每层注意力调用 <code>vllm/v1/attention/backends/flash_attn.py</code>（FlashAttention 后端）——<strong>PagedAttention 在 V1 中以"页表感知的 FlashAttention"形式存在</strong>，它按 block_table 逐块读取 KV 完成注意力计算（第 04 章机制在这里落地）；</li>
+        <li><strong>采样</strong>：logits → <code>vllm/v1/sample/</code> 采样器（temperature/top_p/penalties...）→ 本步的 token id。</li>
+      </ol>
+
+      <h2><span class="sec-no">6.5</span>第四站：结果回传（回到进程 1）</h2>
+      <p><strong>文件：<code>vllm/v1/engine/output_processor.py</code> + <code>detokenizer.py</code></strong></p>
+      <ul>
+        <li>每个请求有独立状态机（<code>RequestState</code>）：WAITING → RUNNING → FINISHED/ABORTED；</li>
+        <li>收到 token id → <strong>增量反分词</strong>（注意坑：UTF-8 汉字可能被拆在两个 token 里，detokenizer 要缓存不完整字节，直到凑齐才输出）；</li>
+        <li>组装 <code>RequestOutput</code>（含 <code>delta</code> 文本、完成原因 stop/length、token 计数）推回 <code>AsyncLLM</code> 的输出队列；</li>
+        <li>API 层把 delta 包成 SSE <code>data: {...}</code> 帧发出——你看到的"打字机"由此而来。</li>
+      </ul>
+
+      <h2><span class="sec-no">6.6</span>全程飞行记录仪：给关键路径插桩</h2>
+      <p>纸上得来终觉浅。下面这个 monkeypatch 脚本不改源码文件，就能在运行时打印关键事件：</p>
+      <div class="code-head"><span>lab/instrument.py</span></div>
+      <pre><code class="language-python"># lab/instrument.py —— 飞行记录仪（真机运行）
+import vllm.v1.engine.core as core_mod
+from vllm import LLM, SamplingParams
+
+orig_step = core_mod.EngineCore.step
+
+def my_step(self):
+    sched = self.scheduler
+    print(f"[step] running={len(sched.running)} waiting={len(sched.waiting)}")
+    out = orig_step(self)
+    return out
+
+core_mod.EngineCore.step = my_step   # 猴子补丁: 包一层
+
+llm = LLM(model="Qwen/Qwen2.5-0.5B-Instruct",
+          max_model_len=512, gpu_memory_utilization=0.85)
+llm.generate([f"问题{i}：介绍一下春天。" for i in range(6)],
+             SamplingParams(max_tokens=32, ignore_eos=True))</code></pre>
+      <div class="code-head"><span>bash</span></div>
+      <pre><code class="language-bash">python lab/instrument.py
+# 观察输出: 开始时 waiting=6 → 逐步全部转入 running → 结束前逐个退出</code></pre>
+      <div class="callout tip"><p>这个技巧叫 <strong>monkeypatch 插桩</strong>，是二次开发前最安全的观察手段——不改一行源码文件，先看清内部行为。第 10 章定制开发会大量用到。</p></div>
+
+      <h2><span class="sec-no">6.7</span>源码导航手册（遇到问题去哪查）</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>现象/问题</th><th>先看哪里</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>某参数不生效/含义不明</td><td><code>vllm/engine/arg_utils.py</code>（全部参数的注释与默认值）</td></tr>
+            <tr><td>请求排队久、抢占频繁</td><td><code>vllm/v1/core/sched/scheduler.py</code></td></tr>
+            <tr><td>KV 显存相关</td><td><code>vllm/v1/core/kv_cache_manager.py</code>、<code>kv_cache_utils.py</code></td></tr>
+            <tr><td>输出乱码/截断</td><td><code>vllm/v1/engine/detokenizer.py</code></td></tr>
+            <tr><td>吞吐上不去</td><td><code>gpu_model_runner.py</code>（CUDA Graph 路径）+ 第 09 章</td></tr>
+            <tr><td>新模型支持</td><td><code>vllm/model_executor/models/registry.py</code>（第 10 章）</td></tr>
+            <tr><td>API 报错行为</td><td><code>vllm/entrypoints/openai/api_server.py</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2><span class="sec-no">6.8</span>本章小结 + 自测</h2>
+      <details class="quiz">
+        <summary>📋 本章自测</summary>
+        <div class="quiz-body">
+          <ol>
+            <li>画出"add_request 到第一个 token 返回"之间至少 5 个关键节点（进程也要标对）。</li>
+            <li>为什么说 <code>add_request</code> 是非阻塞的？这对吞吐有什么意义？</li>
+            <li>CUDA Graph 加速的是什么开销？为什么主要用在 decode 阶段？</li>
+            <li>增量反分词为什么要缓存不完整字节？</li>
+            <li>用 instrument.py 亲手验证：6 个请求几乎同时到达时，是 6 个一起 prefill 还是一个一个来？为什么？</li>
+          </ol>
+        </div>
+      </details>
+
+      <nav class="pager">
+        <a href="ch05.html"><div class="dir">← 上一章</div><div class="title">调度器与连续批处理</div></a>
+        <a class="next" href="ch07.html"><div class="dir">下一章 →</div><div class="title">分布式并行 TP/PP/EP</div></a>
+      </nav>
+      <footer>vLLM 定制开发教程 · 可视化网页版 ｜ <a href="../index.html">返回目录</a></footer>
+    </article>
+  </div>
+</div>
+<script src="../assets/js/main.js"></script>
+<script src="../assets/js/visuals.js"></script>
+<script src="../assets/js/mathjax-tex-svg.js"></script>
+</body>
+</html>
