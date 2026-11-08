@@ -28,12 +28,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 自动为仓库开启 GitHub Pages（build_type=workflow），已开启则跳过
-      - name: Configure Pages
-        uses: actions/configure-pages@v5
-        with:
-          enablement: true
-
+      # 注意：Pages 需在仓库 Settings → Pages → Source 选 "GitHub Actions" 一次性开启
+      # 页面全部使用相对路径，无需 configure-pages 获取 baseURL
       - name: Upload site artifact
         uses: actions/upload-pages-artifact@v3
         with:
